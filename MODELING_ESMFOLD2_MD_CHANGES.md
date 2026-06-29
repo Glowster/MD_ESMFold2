@@ -147,10 +147,10 @@ The inference-only structure sampler in `DiffusionStructureHead` was split into:
 
 The training script currently prepares these tensors:
 
-- `x_t`: centered current MD frame, padded to the ESMFold2 atom count.
+- `x_t`: current MD frame remapped from mdCATH PDB atom order into ESMFold2 heavy-atom feature order, centered over valid mapped atoms, and padded to the ESMFold2 atom count.
 - `dt`: frame delta converted to seconds.
-- `target_atom_coords`: centered and Kabsch-aligned future frame, padded to atom count.
-- `target_atom_mask`: valid atom mask intersected with ESMFold2 atom attention mask.
+- `target_atom_coords`: future frame remapped into ESMFold2 heavy-atom order, centered, Kabsch-aligned to `x_t`, and padded to atom count.
+- `target_atom_mask`: valid mapped heavy-atom mask intersected with ESMFold2 atom attention mask.
 
 The model changes now support the training script call:
 
@@ -167,7 +167,16 @@ model.forward_train(**features, **extra)
 - Set all model parameters to `requires_grad_(False)`.
 - Set `model.md_conditioning.parameters()` to `requires_grad_(True)`.
 - Build the optimizer from trainable parameters only.
+- Default MD training sampling uses `--num-sampling-steps 1`, with `--num-loops` also exposed for smoke/debug runs.
+
+The script also now builds an atom map from each HDF5 file's `pdbProteinAtoms` template, because mdCATH atom order includes hydrogens and terminal/capping atoms and does not match ESMFold2 heavy-atom feature order directly.
+
+Atom mapping normalizes common histidine protonation residue names (`HID`, `HIE`, `HIP`, `HSD`, `HSE`, `HSP`) to `HIS`, and accepts mdCATH's `ILE CD` name as ESMFold2's `ILE CD1`.
+
+Full atom-map validation over `data/mdcath_320K_len_le200/data` checked 4,470 usable files with 3,817,536 mapped heavy atoms and zero mapping failures. The loader skips 12 files where `pdbProteinAtoms` has a different number of protein residue groups than the HDF5 `sequence`.
 
 ## Known Remaining Gap
 
-Optional later optimization: precompute and cache `lm_hidden_states` per sequence so MD training does not repeatedly run frozen ESMC.
+- A tiny random-model runtime smoke test passed: `forward_train(...)` produced a grad-enabled loss, `loss.backward()` produced gradients on `md_conditioning`, and no non-`md_conditioning` parameters had gradients.
+- A full pretrained `biohub/ESMFold2` one-batch run is still needed in the intended training environment.
+- Optional later optimization: precompute and cache `lm_hidden_states` per sequence so MD training does not repeatedly run frozen ESMC.
