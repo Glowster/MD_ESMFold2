@@ -1,0 +1,23 @@
+# Ignore everything by default.
+*
+
+# Allow directory traversal so nested allow rules can match.
+!*/
+
+# Keep repository policy tracked.
+!.gitignore
+
+# Track Python source files only.
+!*.py
+!**/*.py
+
+# Keep generated Python artifacts out.
+__pycache__/
+*.py[cod]
+
+# Keep Codex/session metadata and the nested ESM fork out of this wrapper repo.
+/.git/
+/.outer-git/
+/.agents/
+/.codex/
+/esm/
