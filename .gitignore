@@ -10,6 +10,7 @@
 # Track Python source files only.
 !*.py
 !**/*.py
+!MODELING_ESMFOLD2_MD_CHANGES.md
 
 # Keep generated Python artifacts out.
 __pycache__/

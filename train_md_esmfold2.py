@@ -197,6 +197,17 @@ def center(coords):
     return coords - coords.mean(axis=0, keepdims=True)
 
 
+def kabsch_align(moving, target):
+    _, np = need_h5py()
+    cov = moving.T @ target
+    u, _, vt = np.linalg.svd(cov)
+    rot = vt.T @ u.T
+    if np.linalg.det(rot) < 0:
+        vt[-1] *= -1
+        rot = vt.T @ u.T
+    return moving @ rot
+
+
 def pad_atom_coords(coords, atom_count: int, device: torch.device) -> torch.Tensor:
     out = torch.zeros(1, atom_count, 3, dtype=torch.float32, device=device)
     n_atoms = coords.shape[0]
@@ -232,8 +243,10 @@ def tensorize_record(record: dict, args: argparse.Namespace, feature_cache: dict
     features = {k: v.to(device) for k, v in feature_cache[sequence].items()}
     atom_count = features["ref_pos"].shape[1]
 
-    x_t = pad_atom_coords(center(pair[0]), atom_count, device)
-    x_target = pad_atom_coords(center(pair[1]), atom_count, device)
+    current = center(pair[0])
+    target = kabsch_align(center(pair[1]), current)
+    x_t = pad_atom_coords(current, atom_count, device)
+    x_target = pad_atom_coords(target, atom_count, device)
 
     # This assumes mdCATH atom order matches the ESMFold2 protein featurizer.
     # If that turns out false, this is the only place that needs an atom map.
@@ -421,7 +434,27 @@ def main() -> int:
     if hasattr(model, "set_kernel_backend"):
         model.set_kernel_backend(None)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if not hasattr(model, "md_conditioning"):
+        raise RuntimeError(
+            "Expected ESMFold2Model.md_conditioning for Stage 1 MD fine-tuning"
+        )
+    for param in model.parameters():
+        param.requires_grad_(False)
+    for param in model.md_conditioning.parameters():
+        param.requires_grad_(True)
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters found after enabling md_conditioning")
+    trainable_count = sum(param.numel() for param in trainable_params)
+    total_count = sum(param.numel() for param in model.parameters())
+    print(
+        f"trainable_params={trainable_count} total_params={total_count} "
+        "trainable_module=md_conditioning"
+    )
+
+    optimizer = torch.optim.AdamW(
+        trainable_params, lr=args.lr, weight_decay=args.weight_decay
+    )
     feature_cache: dict = {}
     loss_csv = run_dir / "loss.csv"
 
