@@ -20,8 +20,8 @@ Current comparison context:
 - Nested repo branch: `MD`
 - Baseline branch: `main`
 - Last reviewed: 2026-06-29
-- Current `modeling_esmfold2.py` diff size: 414 insertions, 21 deletions
-- Current `modeling_esmfold2_common.py` diff size: 11 insertions, 3 deletions
+- Current `modeling_esmfold2.py` diff size: 436 insertions, 44 deletions
+- Current `modeling_esmfold2_common.py` diff size: 113 insertions, 3 deletions
 
 ## Purpose
 
@@ -135,13 +135,25 @@ It calls `_forward_impl(...)` with:
 - `compute_confidence=False`
 - `num_diffusion_samples=1` by default
 
-When target coordinates and a target mask are provided, it computes masked coordinate MSE and returns it as `output["loss"]`.
+When target coordinates and a target mask are provided, it calls the diffusion head's single-noise-level training path rather than the inference sampler.
+
+`DiffusionStructureHead.train_denoising(...)` now owns the diffusion training loss:
+
+- Samples `sigma` from the configured ESMFold2 training noise distribution, using `sigma_data`, `train_noise_log_mean`, and `train_noise_log_std`.
+- Applies the same center/random-rotation/random-translation augmentation used by the structure head.
+- Constructs `x_noisy = x_target + sigma * noise`.
+- Runs `diffusion_module(...)` once.
+- Computes the masked MSE between `x_denoised` and the augmented target.
+- Returns `output["loss"]`, `x_pred`, `x_noisy`, `noise_sigma`, `denoise_rmsd`, `noisy_rmsd`, and `noise_sigma_mean`.
+
+This replaced an earlier incorrect debug path where `forward_train(...)` called the inference sampler with `num_sampling_steps=1` and compared `sample_atom_coords` directly to the target. That path produced losses around 50,000 because it was still at inference-noise scale and was not a diffusion training objective.
 
 The inference-only structure sampler in `DiffusionStructureHead` was split into:
 
 - `_sample_impl(...)`: shared sampling implementation.
 - `sample(...)`: inference wrapper that preserves `@torch.inference_mode()`.
-- `sample_train(...)`: grad-enabled sampler used by `forward_train(...)`.
+- `sample_train(...)`: grad-enabled sampler for explicit debug experiments.
+- `sample_train(...)` is retained for explicit debug use, but `forward_train(...)` with targets no longer uses it for the loss.
 
 ## Relationship To `train_md_esmfold2.py`
 
@@ -168,6 +180,12 @@ model.forward_train(**features, **extra)
 - Set `model.md_conditioning.parameters()` to `requires_grad_(True)`.
 - Build the optimizer from trainable parameters only.
 - Default MD training sampling uses `--num-sampling-steps 1`, with `--num-loops` also exposed for smoke/debug runs.
+- `loss.csv` is appended once per optimizer step, so each batch contributes one row for plotting the training loss curve.
+- `loss.csv` now also logs `denoise_rmsd`, `noisy_rmsd`, and `noise_sigma_mean` when the model returns them.
+- The script accepts `--esmc-model` and `--esmc-precision`, allowing fully local/offline loading of ESMFold2 plus the ESMC backbone.
+- Checkpoints are lightweight by default: they save `md_conditioning`, optimizer state, trainable parameter names, args, epoch, and step. The frozen ESMFold2/ESMC weights are not saved unless `--save-full-checkpoint` is explicitly passed.
+- Step checkpoints are controlled by `--save-every`; epoch checkpoints are controlled by `--save-every-epochs`, which defaults to 10. `last.pt` is always saved at the end.
+- Checkpoint args are saved in JSON-serializable form so PyTorch 2.6 can load the checkpoint with its default `weights_only=True` behavior.
 
 The script also now builds an atom map from each HDF5 file's `pdbProteinAtoms` template, because mdCATH atom order includes hydrogens and terminal/capping atoms and does not match ESMFold2 heavy-atom feature order directly.
 
@@ -175,8 +193,47 @@ Atom mapping normalizes common histidine protonation residue names (`HID`, `HIE`
 
 Full atom-map validation over `data/mdcath_320K_len_le200/data` checked 4,470 usable files with 3,817,536 mapped heavy atoms and zero mapping failures. The loader skips 12 files where `pdbProteinAtoms` has a different number of protein residue groups than the HDF5 `sequence`.
 
-## Known Remaining Gap
+## Validation Status
 
 - A tiny random-model runtime smoke test passed: `forward_train(...)` produced a grad-enabled loss, `loss.backward()` produced gradients on `md_conditioning`, and no non-`md_conditioning` parameters had gradients.
-- A full pretrained `biohub/ESMFold2` one-batch run is still needed in the intended training environment.
+- Full local model snapshots were downloaded under `/home/theodor/MD_ESMFold2/hf_models`:
+  - `biohub_ESMFold2`: 1.3G
+  - `biohub_ESMC-6B`: 24G, with all six safetensor shards present
+- A full pretrained one-step smoke test passed using the downloaded local snapshots, one mdCATH domain, `num_loops=1`, and `num_sampling_steps=1`.
+  - Device used: CPU, because this environment's PyTorch build could not use the installed NVIDIA driver.
+  - Selected domain: `1a92A00`, length 50.
+  - Trainable parameters: 149,124, all from `md_conditioning`.
+  - Total loaded parameters: 6,580,251,553.
+  - Loss before step: 50,470.132812.
+  - `loss.requires_grad=True`.
+  - `md_conditioning` gradient parameters: 12.
+  - Sum of absolute `md_conditioning` gradients: 532.71000358.
+  - Non-`md_conditioning` gradient parameters: 0.
+  - `optimizer.step()` completed.
+- A bounded Stage 1 GPU run was started in tmux session `md_esmfold2_gpu0_stage1` on GPU 0 with:
+  - `torch==2.6.0+cu124`, matching the NVIDIA 550.144.03 driver.
+  - `CUDA_VISIBLE_DEVICES=0`, `--device cuda:0`.
+  - Local offline model paths for ESMFold2 and ESMC-6B.
+  - `--esmc-precision bf16`.
+  - `--epochs 20`, `--steps-per-epoch 10`, `--length-max 300`.
+  - `--num-loops 1`, `--num-sampling-steps 1`.
+  - `--save-every-epochs 10`, `--save-every 0`.
+  - Run directory: `/home/theodor/MD_ESMFold2/runs/md_esmfold2_20260629_155527`.
+  - Log file: `/home/theodor/MD_ESMFold2/runs/tmux_logs/md_esmfold2_gpu0_stage1.log`.
+  - This run was stopped because it used the incorrect inference-sampler training objective.
+- After the diffusion-training fix, a corrected full-model GPU smoke test passed on GPU 0:
+  - Loss: 102.74905395507812.
+  - `denoise_rmsd`: 10.136520385742188.
+  - `noisy_rmsd`: 76.03369903564453.
+  - `noise_sigma_mean`: 43.316070556640625.
+  - `md_conditioning` received gradients; non-`md_conditioning` parameters had no gradients.
+- A corrected one-step `train_md_esmfold2.py` run passed on GPU 0:
+  - Run directory: `/home/theodor/MD_ESMFold2/runs/md_esmfold2_20260629_162253`.
+  - `loss.csv` contains `loss`, `denoise_rmsd`, `noisy_rmsd`, and `noise_sigma_mean`.
+  - `checkpoints/last.pt` is about 1.8 MB, contains `md_conditioning` only, and does not contain full model weights.
+  - The checkpoint loads with PyTorch 2.6 default `torch.load(..., weights_only=True)`.
+
+## Known Remaining Gap
+
+- The CPU full-model smoke test needed ESMC loaded with `precision="fp32"`. Loading ESMC as `bf16` on CPU produced a dtype mismatch between bf16 LM hidden states and fp32 ESMFold2 projection weights.
 - Optional later optimization: precompute and cache `lm_hidden_states` per sequence so MD training does not repeatedly run frozen ESMC.

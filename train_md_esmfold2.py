@@ -59,6 +59,8 @@ ATOM_NAME_ALIASES = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="biohub/ESMFold2")
+    parser.add_argument("--esmc-model", type=Path, default=None)
+    parser.add_argument("--esmc-precision", choices=["auto", "bf16", "fp32", "fp8"], default="auto")
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data" / "mdcath_320K_len_le200" / "data")
     parser.add_argument("--out-dir", type=Path, default=ROOT / "runs")
     parser.add_argument("--temperature", default="320")
@@ -73,7 +75,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--geometric-p", type=float, default=0.1)
     parser.add_argument("--num-sampling-steps", type=int, default=1)
     parser.add_argument("--num-loops", type=int, default=None)
-    parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--save-every", type=int, default=0, help="save every N optimizer steps; 0 disables step checkpoints")
+    parser.add_argument("--save-every-epochs", type=int, default=10, help="save every N epochs; 0 disables epoch checkpoints")
+    parser.add_argument("--save-full-checkpoint", action="store_true", help="also save the full model state; default saves md_conditioning only")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -521,23 +525,60 @@ def training_loss(
     if "loss" in out:
         return out["loss"], out
 
-    coord_key = "sample_atom_coords" if "sample_atom_coords" in out else "x_pred"
-    loss = masked_mse(out[coord_key], extra["target_atom_coords"], extra["target_atom_mask"])
-    return loss, out
+    raise RuntimeError(
+        "model.forward_train(...) did not return a diffusion training loss"
+    )
+
+
+def scalar_if_present(out: dict, key: str) -> float | None:
+    value = out.get(key)
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return float(value.detach().float().mean().cpu())
+    return float(value)
+
+
+def state_dict_to_cpu(state_dict: dict) -> dict:
+    return {
+        key: value.detach().cpu() if torch.is_tensor(value) else value
+        for key, value in state_dict.items()
+    }
+
+
+def tree_to_cpu(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: tree_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [tree_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(tree_to_cpu(item) for item in value)
+    return value
+
+
+def serializable_args(args: argparse.Namespace) -> dict:
+    return json.loads(json.dumps(vars(args), default=str))
 
 
 def save_checkpoint(path: Path, model, optimizer, args: argparse.Namespace, epoch: int, step: int):
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "step": step,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "args": vars(args),
-        },
-        path,
-    )
+    checkpoint = {
+        "epoch": epoch,
+        "step": step,
+        "checkpoint_kind": "md_conditioning",
+        "md_conditioning": state_dict_to_cpu(model.md_conditioning.state_dict()),
+        "trainable_parameter_names": [
+            name for name, param in model.named_parameters() if param.requires_grad
+        ],
+        "optimizer": tree_to_cpu(optimizer.state_dict()),
+        "args": serializable_args(args),
+    }
+    if args.save_full_checkpoint:
+        checkpoint["checkpoint_kind"] = "full_model"
+        checkpoint["model"] = state_dict_to_cpu(model.state_dict())
+    torch.save(checkpoint, path)
 
 
 def append_loss_row(path: Path, row: dict):
@@ -547,6 +588,24 @@ def append_loss_row(path: Path, row: dict):
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+def resolve_esmc_precision(device: torch.device, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    return "bf16" if device.type == "cuda" else "fp32"
+
+
+def load_model(args: argparse.Namespace, device: torch.device):
+    esmc_precision = resolve_esmc_precision(device, args.esmc_precision)
+    if args.esmc_model is None:
+        model = ESMFold2Model.from_pretrained(args.model, esmc_precision=esmc_precision)
+        return model.to(device)
+
+    model = ESMFold2Model.from_pretrained(args.model, load_esmc=False)
+    model.to(device)
+    model.load_esmc(str(args.esmc_model), precision=esmc_precision)
+    return model
 
 
 def main() -> int:
@@ -562,8 +621,7 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2, default=str) + "\n")
 
-    model = ESMFold2Model.from_pretrained(args.model)
-    model.to(device)
+    model = load_model(args, device)
     model.train()
     if hasattr(model, "set_kernel_backend"):
         model.set_kernel_backend(None)
@@ -604,7 +662,7 @@ def main() -> int:
         for batch_records in batches:
             optimizer.zero_grad(set_to_none=True)
             features, extra, info = tensorize_batch(batch_records, args, feature_cache, device)
-            loss, _ = training_loss(model, features, extra, args)
+            loss, out = training_loss(model, features, extra, args)
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -618,11 +676,19 @@ def main() -> int:
                 "lr": optimizer.param_groups[0]["lr"],
                 **info,
             }
+            for key in ("denoise_rmsd", "noisy_rmsd", "noise_sigma_mean"):
+                value = scalar_if_present(out, key)
+                if value is not None:
+                    row[key] = value
             append_loss_row(loss_csv, row)
 
-            if global_step % args.save_every == 0:
+            if args.save_every > 0 and global_step % args.save_every == 0:
                 save_checkpoint(ckpt_dir / f"step_{global_step:07d}.pt", model, optimizer, args, epoch, global_step)
                 print(f"epoch={epoch} step={global_step} loss={row['loss']:.5f}")
+
+        if args.save_every_epochs > 0 and epoch % args.save_every_epochs == 0:
+            save_checkpoint(ckpt_dir / f"epoch_{epoch:04d}.pt", model, optimizer, args, epoch, global_step)
+            print(f"saved checkpoint epoch={epoch} step={global_step}")
 
     save_checkpoint(ckpt_dir / "last.pt", model, optimizer, args, args.epochs, global_step)
     print(f"done: {run_dir}")
