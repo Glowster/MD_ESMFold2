@@ -80,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=0, help="save every N optimizer steps; 0 disables step checkpoints")
     parser.add_argument("--save-every-epochs", type=int, default=10, help="save every N epochs; 0 disables epoch checkpoints")
     parser.add_argument("--save-full-checkpoint", action="store_true", help="also save the full model state; default saves md_conditioning only")
+    parser.add_argument("--resume-checkpoint", type=Path, default=None, help="resume md_conditioning and optimizer state from a training checkpoint")
     parser.add_argument("--val-every", type=int, default=100, help="run fixed validation every N optimizer steps; 0 disables validation")
     parser.add_argument("--val-batches", type=int, default=4)
     parser.add_argument("--val-fraction", type=float, default=0.05)
@@ -711,7 +712,11 @@ def tree_to_cpu(value):
 
 
 def serializable_args(args: argparse.Namespace) -> dict:
-    return json.loads(json.dumps(vars(args), default=str))
+    result = json.loads(json.dumps(vars(args), default=str))
+    #Diagnostics: This metadata makes x_t -> x_t runs explicit in args.json/checkpoints; remove this block when removing --target-current-frame.
+    if result.get("target_current_frame"):
+        result["diagnostic_target"] = "target_atom_coords = x_t (current input frame), not x_t+dt"
+    return result
 
 
 def save_checkpoint(path: Path, model, optimizer, args: argparse.Namespace, epoch: int, step: int):
@@ -731,6 +736,22 @@ def save_checkpoint(path: Path, model, optimizer, args: argparse.Namespace, epoc
         checkpoint["checkpoint_kind"] = "full_model"
         checkpoint["model"] = state_dict_to_cpu(model.state_dict())
     torch.save(checkpoint, path)
+
+
+def load_training_checkpoint(path: Path, model, optimizer, device: torch.device) -> tuple[int, int]:
+    checkpoint = torch.load(path, map_location=device)
+    if "md_conditioning" not in checkpoint:
+        raise RuntimeError(f"{path} does not contain md_conditioning weights")
+    model.md_conditioning.load_state_dict(checkpoint["md_conditioning"])
+    if "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    return int(checkpoint.get("epoch", 0)), int(checkpoint.get("step", 0))
+
+
+def run_dir_from_resume_checkpoint(path: Path) -> Path | None:
+    if path.parent.name == "checkpoints":
+        return path.parent.parent
+    return None
 
 
 def append_loss_row(path: Path, row: dict):
@@ -770,11 +791,19 @@ def main() -> int:
     if not train_records:
         raise RuntimeError("validation split left no training records")
 
-    run_name = "md_esmfold2_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = args.out_dir / run_name
+    resume_run_dir = (
+        run_dir_from_resume_checkpoint(args.resume_checkpoint)
+        if args.resume_checkpoint is not None
+        else None
+    )
+    if resume_run_dir is None:
+        run_name = "md_esmfold2_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = args.out_dir / run_name
+    else:
+        run_dir = resume_run_dir
     ckpt_dir = run_dir / "checkpoints"
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2, default=str) + "\n")
+    (run_dir / "args.json").write_text(json.dumps(serializable_args(args), indent=2, default=str) + "\n")
     if val_records:
         (run_dir / "validation_domains.txt").write_text(
             "\n".join(record["domain"] for record in sorted(val_records, key=lambda r: r["domain"])) + "\n"
@@ -810,6 +839,16 @@ def main() -> int:
     optimizer = torch.optim.AdamW(
         trainable_params, lr=args.lr, weight_decay=args.weight_decay
     )
+    start_epoch = 0
+    global_step = 0
+    if args.resume_checkpoint is not None:
+        start_epoch, global_step = load_training_checkpoint(
+            args.resume_checkpoint, model, optimizer, device
+        )
+        print(
+            f"resumed_checkpoint={args.resume_checkpoint} "
+            f"start_epoch={start_epoch} global_step={global_step}"
+        )
     feature_cache: dict = {}
     loss_csv = run_dir / "loss.csv"
     validation_csv = run_dir / "validation.csv"
@@ -817,8 +856,7 @@ def main() -> int:
     if val_records and not validation_batches:
         print("validation disabled: no validation batches fit val_length_max")
 
-    global_step = 0
-    if validation_batches:
+    if validation_batches and args.resume_checkpoint is None:
         run_validation(
             model,
             validation_batches,
@@ -829,7 +867,13 @@ def main() -> int:
             step=global_step,
         )
 
-    for epoch in range(1, args.epochs + 1):
+    if start_epoch >= args.epochs:
+        raise RuntimeError(
+            f"resume checkpoint is already at epoch {start_epoch}, "
+            f"but --epochs is {args.epochs}; pass a larger total epoch count"
+        )
+
+    for epoch in range(start_epoch + 1, args.epochs + 1):
         batches = make_smart_batches(train_records, args.length_max, args.batch_exp)
         if args.steps_per_epoch > 0:
             batches = batches[: args.steps_per_epoch]
