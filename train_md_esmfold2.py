@@ -73,11 +73,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-delta-frames", type=int, default=100)
     parser.add_argument("--frame-time-ns", type=float, default=1.0)
     parser.add_argument("--geometric-p", type=float, default=0.1)
+    #Diagnostics: Pass this flag to train against x_t instead of x_t+dt; leave it off to change back to normal future-frame training.
+    parser.add_argument("--target-current-frame", action="store_true", help="diagnostic: use x_t as target_atom_coords instead of the future frame")
     parser.add_argument("--num-sampling-steps", type=int, default=1)
     parser.add_argument("--num-loops", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=0, help="save every N optimizer steps; 0 disables step checkpoints")
     parser.add_argument("--save-every-epochs", type=int, default=10, help="save every N epochs; 0 disables epoch checkpoints")
     parser.add_argument("--save-full-checkpoint", action="store_true", help="also save the full model state; default saves md_conditioning only")
+    parser.add_argument("--val-every", type=int, default=100, help="run fixed validation every N optimizer steps; 0 disables validation")
+    parser.add_argument("--val-batches", type=int, default=4)
+    parser.add_argument("--val-fraction", type=float, default=0.05)
+    parser.add_argument("--val-length-max", type=int, default=None)
+    parser.add_argument("--val-seed", type=int, default=12345)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -156,17 +163,17 @@ def length_to_batch(length: int, length_max: int, batch_exp: float) -> int:
     return math.floor((float(length_max) / float(length)) ** float(batch_exp))
 
 
-def one_record_per_cluster(records: list[dict]) -> list[dict]:
+def one_record_per_cluster(records: list[dict], rng=random) -> list[dict]:
     by_cluster: dict[str, list[dict]] = {}
     for record in records:
         by_cluster.setdefault(record["cluster"], []).append(record)
-    return [random.choice(group) for group in by_cluster.values()]
+    return [rng.choice(group) for group in by_cluster.values()]
 
 
-def make_smart_batches(records: list[dict], length_max: int, batch_exp: float) -> list[list[dict]]:
-    sampled = one_record_per_cluster(records)
+def make_smart_batches(records: list[dict], length_max: int, batch_exp: float, rng=random) -> list[list[dict]]:
+    sampled = one_record_per_cluster(records, rng=rng)
     sampled = [r for r in sampled if length_to_batch(r["length"], length_max, batch_exp) > 0]
-    sampled.sort(key=lambda r: r["length"] + 2.0 * random.gauss(0.0, 1.0))
+    sampled.sort(key=lambda r: r["length"] + 2.0 * rng.gauss(0.0, 1.0))
 
     batches: list[list[dict]] = []
     current: list[dict] = []
@@ -187,8 +194,31 @@ def make_smart_batches(records: list[dict], length_max: int, batch_exp: float) -
     if current:
         batches.append(current)
 
-    random.shuffle(batches)
+    rng.shuffle(batches)
     return batches
+
+
+def split_train_validation_records(records: list[dict], args: argparse.Namespace) -> tuple[list[dict], list[dict]]:
+    if args.val_every <= 0 or args.val_batches <= 0 or args.val_fraction <= 0:
+        return records, []
+
+    by_cluster: dict[str, list[dict]] = {}
+    for record in records:
+        by_cluster.setdefault(record["cluster"], []).append(record)
+
+    clusters = sorted(by_cluster)
+    if len(clusters) < 2:
+        return records, []
+
+    rng = random.Random(args.val_seed)
+    rng.shuffle(clusters)
+    n_val = max(1, int(round(len(clusters) * args.val_fraction)))
+    n_val = min(n_val, len(clusters) - 1)
+    val_clusters = set(clusters[:n_val])
+
+    train_records = [record for record in records if record["cluster"] not in val_clusters]
+    val_records = [record for record in records if record["cluster"] in val_clusters]
+    return train_records, val_records
 
 
 def find_axis(shape: tuple[int, ...], size: int, name: str) -> int:
@@ -198,17 +228,17 @@ def find_axis(shape: tuple[int, ...], size: int, name: str) -> int:
     return axes[0]
 
 
-def truncated_geometric(max_value: int, p: float) -> int:
-    u = random.random()
+def truncated_geometric(max_value: int, p: float, rng=random) -> int:
+    u = rng.random()
     tail = 1.0 - (1.0 - p) ** max_value
     return max(1, min(max_value, math.ceil(math.log(1.0 - u * tail) / math.log(1.0 - p))))
 
 
-def choose_delta(n_frames: int, max_delta_frames: int, geometric_p: float) -> int:
+def choose_delta(n_frames: int, max_delta_frames: int, geometric_p: float, rng=random) -> int:
     max_delta = min(max_delta_frames, n_frames - 1)
-    if random.random() < 0.5:
-        return truncated_geometric(max_delta, geometric_p)
-    return random.randint(1, max_delta)
+    if rng.random() < 0.5:
+        return truncated_geometric(max_delta, geometric_p, rng=rng)
+    return rng.randint(1, max_delta)
 
 
 def read_two_frames(coords, num_atoms: int, num_frames: int, frame_a: int, frame_b: int):
@@ -347,7 +377,7 @@ def pad_atom_coords(coords, atom_count: int, device: torch.device) -> torch.Tens
     return out
 
 
-def tensorize_record(record: dict, args: argparse.Namespace, feature_cache: dict, device: torch.device):
+def tensorize_record(record: dict, args: argparse.Namespace, feature_cache: dict, device: torch.device, rng=random):
     h5py, _ = need_h5py()
     path = record["path"]
     domain = record["domain"]
@@ -355,8 +385,8 @@ def tensorize_record(record: dict, args: argparse.Namespace, feature_cache: dict
     with h5py.File(path, "r") as h5:
         group = h5[domain]
         sequence = record["sequence"]
-        temperature = args.temperature if args.temperature in group else random.choice([k for k in group if k.isdigit()])
-        run = random.choice(sorted(group[temperature].keys(), key=int))
+        temperature = args.temperature if args.temperature in group else rng.choice([k for k in group if k.isdigit()])
+        run = rng.choice(sorted(group[temperature].keys(), key=int))
         run_group = group[temperature][run]
 
         coords = run_group["coords"]
@@ -364,8 +394,8 @@ def tensorize_record(record: dict, args: argparse.Namespace, feature_cache: dict
         num_frames = int(run_group.attrs.get("numFrames", coords.shape[-1]))
         pdb_text = as_text(group["pdbProteinAtoms"][()])
 
-        delta_frames = choose_delta(num_frames, args.max_delta_frames, args.geometric_p)
-        frame = random.randint(0, num_frames - delta_frames - 1)
+        delta_frames = choose_delta(num_frames, args.max_delta_frames, args.geometric_p, rng=rng)
+        frame = rng.randint(0, num_frames - delta_frames - 1)
         pair = read_two_frames(coords, num_atoms, num_frames, frame, frame + delta_frames)
 
     if sequence not in feature_cache:
@@ -380,7 +410,11 @@ def tensorize_record(record: dict, args: argparse.Namespace, feature_cache: dict
     current = center_masked(current, valid_atoms)
     target = kabsch_align(center_masked(target, valid_atoms), current, valid_atoms)
     x_t = pad_atom_coords(current, atom_count, device)
-    x_target = pad_atom_coords(target, atom_count, device)
+    #Diagnostics: This is the x_t -> x_t diagnostic target. To change back, omit --target-current-frame or remove this branch.
+    if args.target_current_frame:
+        x_target = x_t.clone()
+    else:
+        x_target = pad_atom_coords(target, atom_count, device)
 
     atom_mask = torch.from_numpy(valid_atoms).to(device=device).unsqueeze(0)
     atom_mask &= features["atom_attention_mask"]
@@ -478,13 +512,13 @@ def pad_extras(extra_list: list[dict]) -> dict:
     }
 
 
-def tensorize_batch(records: list[dict], args: argparse.Namespace, feature_cache: dict, device: torch.device):
+def tensorize_batch(records: list[dict], args: argparse.Namespace, feature_cache: dict, device: torch.device, rng=random):
     feature_list = []
     extra_list = []
     infos = []
 
     for record in records:
-        features, extra, info = tensorize_record(record, args, feature_cache, device)
+        features, extra, info = tensorize_record(record, args, feature_cache, device, rng=rng)
         feature_list.append(features)
         extra_list.append(extra)
         infos.append(info)
@@ -528,6 +562,124 @@ def training_loss(
     raise RuntimeError(
         "model.forward_train(...) did not return a diffusion training loss"
     )
+
+
+def build_validation_batches(
+    val_records: list[dict],
+    args: argparse.Namespace,
+    feature_cache: dict,
+    device: torch.device,
+) -> list[tuple[dict, dict, dict]]:
+    if not val_records:
+        return []
+
+    rng = random.Random(args.val_seed)
+    val_length_max = args.val_length_max or args.length_max
+    record_batches = make_smart_batches(
+        val_records,
+        val_length_max,
+        args.batch_exp,
+        rng=rng,
+    )
+    record_batches = record_batches[: args.val_batches]
+    return [
+        tensorize_batch(batch, args, feature_cache, device, rng=rng)
+        for batch in record_batches
+    ]
+
+
+def stage1_train_mode(model) -> None:
+    model.eval()
+    model.md_conditioning.train()
+
+
+def fork_validation_rng(device: torch.device):
+    devices = []
+    if device.type == "cuda":
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        devices = [device_index]
+    return torch.random.fork_rng(devices=devices)
+
+
+@torch.no_grad()
+def run_validation(
+    model,
+    validation_batches: list[tuple[dict, dict, dict]],
+    args: argparse.Namespace,
+    device: torch.device,
+    csv_path: Path,
+    epoch: int,
+    step: int,
+) -> dict:
+    model.eval()
+
+    loss_sum = 0.0
+    atom_weight_sum = 0.0
+    denoise_mse_sum = 0.0
+    denoise_mse_weight_sum = 0.0
+    noisy_mse_sum = 0.0
+    noisy_mse_weight_sum = 0.0
+    sigma_sum = 0.0
+    sigma_weight_sum = 0.0
+    sample_count = 0
+
+    for batch_idx, (features, extra, _) in enumerate(validation_batches):
+        with fork_validation_rng(device):
+            torch.manual_seed(args.val_seed + batch_idx)
+            loss, out = training_loss(model, features, extra, args)
+
+        atom_weight = float(extra["target_atom_mask"].float().sum().detach().cpu())
+        batch_size = int(extra["target_atom_mask"].shape[0])
+        sample_count += batch_size
+
+        loss_sum += float(loss.detach().cpu()) * atom_weight
+        atom_weight_sum += atom_weight
+
+        denoise_mse = scalar_if_present(out, "denoise_mse")
+        if denoise_mse is not None:
+            denoise_mse_sum += denoise_mse * atom_weight
+            denoise_mse_weight_sum += atom_weight
+
+        noisy_mse = scalar_if_present(out, "noisy_mse")
+        if noisy_mse is not None:
+            noisy_mse_sum += noisy_mse * atom_weight
+            noisy_mse_weight_sum += atom_weight
+
+        sigma = scalar_if_present(out, "noise_sigma_mean")
+        if sigma is not None:
+            sigma_sum += sigma * batch_size
+            sigma_weight_sum += batch_size
+
+    row = {
+        "epoch": epoch,
+        "step": step,
+        "loss": loss_sum / max(atom_weight_sum, 1.0),
+        "denoise_rmsd": "",
+        "noisy_rmsd": "",
+        "noise_sigma_mean": "",
+        "val_batches": len(validation_batches),
+        "val_samples": sample_count,
+        "val_atoms": atom_weight_sum,
+    }
+    if denoise_mse_weight_sum:
+        row["denoise_rmsd"] = math.sqrt(max(denoise_mse_sum / denoise_mse_weight_sum, 0.0))
+    if noisy_mse_weight_sum:
+        row["noisy_rmsd"] = math.sqrt(max(noisy_mse_sum / noisy_mse_weight_sum, 0.0))
+    if sigma_weight_sum:
+        row["noise_sigma_mean"] = sigma_sum / sigma_weight_sum
+
+    append_loss_row(csv_path, row)
+    stage1_train_mode(model)
+
+    rmsd_text = (
+        f" denoise_rmsd={row['denoise_rmsd']:.5f}"
+        if isinstance(row["denoise_rmsd"], float)
+        else ""
+    )
+    print(f"validation epoch={epoch} step={step} loss={row['loss']:.5f}{rmsd_text}")
+    return row
 
 
 def scalar_if_present(out: dict, key: str) -> float | None:
@@ -614,15 +766,21 @@ def main() -> int:
     device = torch.device(args.device)
 
     records = load_domain_records(args.data_dir, args.temperature)
+    train_records, val_records = split_train_validation_records(records, args)
+    if not train_records:
+        raise RuntimeError("validation split left no training records")
 
     run_name = "md_esmfold2_" + datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = args.out_dir / run_name
     ckpt_dir = run_dir / "checkpoints"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2, default=str) + "\n")
+    if val_records:
+        (run_dir / "validation_domains.txt").write_text(
+            "\n".join(record["domain"] for record in sorted(val_records, key=lambda r: r["domain"])) + "\n"
+        )
 
     model = load_model(args, device)
-    model.train()
     if hasattr(model, "set_kernel_backend"):
         model.set_kernel_backend(None)
 
@@ -639,9 +797,14 @@ def main() -> int:
         raise RuntimeError("No trainable parameters found after enabling md_conditioning")
     trainable_count = sum(param.numel() for param in trainable_params)
     total_count = sum(param.numel() for param in model.parameters())
+    stage1_train_mode(model)
     print(
         f"trainable_params={trainable_count} total_params={total_count} "
         "trainable_module=md_conditioning"
+    )
+    print(
+        f"records train={len(train_records)} validation={len(val_records)} "
+        f"validation_every={args.val_every}"
     )
 
     optimizer = torch.optim.AdamW(
@@ -649,10 +812,25 @@ def main() -> int:
     )
     feature_cache: dict = {}
     loss_csv = run_dir / "loss.csv"
+    validation_csv = run_dir / "validation.csv"
+    validation_batches = build_validation_batches(val_records, args, feature_cache, device)
+    if val_records and not validation_batches:
+        print("validation disabled: no validation batches fit val_length_max")
 
     global_step = 0
+    if validation_batches:
+        run_validation(
+            model,
+            validation_batches,
+            args,
+            device,
+            validation_csv,
+            epoch=0,
+            step=global_step,
+        )
+
     for epoch in range(1, args.epochs + 1):
-        batches = make_smart_batches(records, args.length_max, args.batch_exp)
+        batches = make_smart_batches(train_records, args.length_max, args.batch_exp)
         if args.steps_per_epoch > 0:
             batches = batches[: args.steps_per_epoch]
 
@@ -665,7 +843,7 @@ def main() -> int:
             loss, out = training_loss(model, features, extra, args)
             loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
             global_step += 1
 
@@ -685,6 +863,17 @@ def main() -> int:
             if args.save_every > 0 and global_step % args.save_every == 0:
                 save_checkpoint(ckpt_dir / f"step_{global_step:07d}.pt", model, optimizer, args, epoch, global_step)
                 print(f"epoch={epoch} step={global_step} loss={row['loss']:.5f}")
+
+            if validation_batches and args.val_every > 0 and global_step % args.val_every == 0:
+                run_validation(
+                    model,
+                    validation_batches,
+                    args,
+                    device,
+                    validation_csv,
+                    epoch=epoch,
+                    step=global_step,
+                )
 
         if args.save_every_epochs > 0 and epoch % args.save_every_epochs == 0:
             save_checkpoint(ckpt_dir / f"epoch_{epoch:04d}.pt", model, optimizer, args, epoch, global_step)

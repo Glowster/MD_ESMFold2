@@ -199,7 +199,7 @@ Full atom-map validation over `data/mdcath_320K_len_le200/data` checked 4,470 us
 - Full local model snapshots were downloaded under `/home/theodor/MD_ESMFold2/hf_models`:
   - `biohub_ESMFold2`: 1.3G
   - `biohub_ESMC-6B`: 24G, with all six safetensor shards present
-- A full pretrained one-step smoke test passed using the downloaded local snapshots, one mdCATH domain, `num_loops=1`, and `num_sampling_steps=1`.
+- Historical note: before the diffusion-training fix, a full pretrained one-step smoke test using the incorrect inference-sampler objective completed but produced the bad loss scale that exposed the issue.
   - Device used: CPU, because this environment's PyTorch build could not use the installed NVIDIA driver.
   - Selected domain: `1a92A00`, length 50.
   - Trainable parameters: 149,124, all from `md_conditioning`.
@@ -232,6 +232,12 @@ Full atom-map validation over `data/mdcath_320K_len_le200/data` checked 4,470 us
   - `loss.csv` contains `loss`, `denoise_rmsd`, `noisy_rmsd`, and `noise_sigma_mean`.
   - `checkpoints/last.pt` is about 1.8 MB, contains `md_conditioning` only, and does not contain full model weights.
   - The checkpoint loads with PyTorch 2.6 default `torch.load(..., weights_only=True)`.
+- A corrected bounded Stage 1 tmux run is active in session `md_esmfold2_gpu0_denoise_stage1`:
+  - Run directory: `/home/theodor/MD_ESMFold2/runs/md_esmfold2_20260629_162510`.
+  - Log file: `/home/theodor/MD_ESMFold2/runs/tmux_logs/md_esmfold2_gpu0_denoise_stage1.log`.
+  - Uses GPU 0, `torch==2.6.0+cu124`, local offline ESMFold2/ESMC-6B paths, and `--esmc-precision bf16`.
+  - Uses `--epochs 20`, `--steps-per-epoch 10`, `--length-max 300`, `--save-every-epochs 10`, and md-only checkpoints.
+  - Early rows show denoising losses in the expected denoising-objective scale, for example `denoise_rmsd` around 3-10 A with `noisy_rmsd` larger.
 
 ## Known Remaining Gap
 
