@@ -104,6 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--geometric-p", type=float, default=0.1)
     #Diagnostics: Pass this flag to train against x_t instead of x_t+dt; leave it off to change back to normal future-frame training.
     parser.add_argument("--target-current-frame", action="store_true", help="diagnostic: use x_t as target_atom_coords instead of the future frame")
+    parser.add_argument("--freeze-zero-dt-encoder", action="store_true", help="diagnostic: zero md_conditioning.dt_encoder parameters and freeze them so dt contributes no pair bias")
     parser.add_argument("--num-sampling-steps", type=int, default=1)
     parser.add_argument("--num-loops", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=0, help="save every N optimizer steps; 0 disables step checkpoints")
@@ -124,6 +125,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--denoise-probe-frame", type=int, default=0, help="frame index for the fixed denoising probe")
     parser.add_argument("--denoise-probe-delta-frames", type=int, default=1, help="sets dt for the fixed denoising probe")
     parser.add_argument("--denoise-probe-sigmas", default="2,8,16,inference_start", help="comma-separated fixed denoising noise levels in Angstrom; use inference_start for the canonical first sampling sigma")
+    parser.add_argument("--denoise-probe-full-inference", action="store_true", help="also run regular diffusion sampling from noise for each probe domain")
+    parser.add_argument("--denoise-probe-full-inference-steps", type=int, default=68, help="diffusion sampling steps for --denoise-probe-full-inference")
     parser.add_argument("--denoise-probe-seed", type=int, default=24680, help="base RNG seed for deterministic probe noise/augmentation")
     parser.add_argument("--denoise-probe-dir", default="denoise_probe", help="subdirectory under the run directory for probe outputs")
     parser.add_argument("--denoise-probe-write-pdbs", action="store_true", help="write target/noisy/prediction PDB snapshots for each probe step")
@@ -665,6 +668,29 @@ DENOISE_PROBE_FIELDS = [
     "local_bond_bad_fraction",
 ]
 
+FULL_INFERENCE_FIELDS = [
+    "epoch",
+    "step",
+    "domain",
+    "temperature",
+    "run",
+    "frame",
+    "dt_seconds",
+    "num_sampling_steps",
+    "sequence_length",
+    "valid_atoms",
+    "rmsd_unaligned",
+    "rmsd_kabsch",
+    "pred_rg",
+    "target_rg",
+    "ca_ca_mean",
+    "ca_ca_min",
+    "ca_ca_max",
+    "local_bond_bad",
+    "local_bond_total",
+    "local_bond_bad_fraction",
+]
+
 
 def sorted_numeric_strings(values) -> list[str]:
     return sorted(values, key=lambda value: int(value) if str(value).isdigit() else str(value))
@@ -851,6 +877,32 @@ def masked_rmsd_value(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tens
     return math.sqrt(max(float(mse.detach().cpu()), 0.0))
 
 
+def kabsch_align_to_target(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    pred = squeeze_sample_coords(pred).float()
+    target = squeeze_sample_coords(target).float()
+    mask_f = mask.float().unsqueeze(-1)
+    denom = mask_f.sum(dim=-2, keepdim=True).clamp_min(1e-8)
+    pred_mean = (pred * mask_f).sum(dim=-2, keepdim=True) / denom
+    target_mean = (target * mask_f).sum(dim=-2, keepdim=True) / denom
+    pred_centered = pred - pred_mean
+    target_centered = target - target_mean
+    cov = torch.einsum("bni,bnj->bij", mask_f * target_centered, pred_centered)
+    cov32 = cov.float()
+    u, _, vh = torch.linalg.svd(
+        cov32,
+        driver="gesvd" if cov32.is_cuda else None,
+    )
+    det = torch.linalg.det(u @ vh)
+    ones = torch.ones_like(det)
+    rot = u @ torch.diag_embed(torch.stack([ones, ones, det], dim=-1)) @ vh
+    rot = rot.to(dtype=pred_centered.dtype)
+    return pred_centered @ rot.transpose(-1, -2) + target_mean
+
+
 def radius_of_gyration_value(coords: torch.Tensor, mask: torch.Tensor) -> float:
     coords = squeeze_sample_coords(coords).float()
     mask_f = mask.float().unsqueeze(-1)
@@ -968,18 +1020,21 @@ def write_probe_overlay_pdb(
     pred: torch.Tensor,
     atom_mask: torch.Tensor,
     noisy: torch.Tensor | None = None,
+    target_label: str = "target_augmented",
+    pred_label: str = "prediction",
+    remark: str = "raw denoise overlay; coordinates are not Kabsch aligned",
 ) -> None:
     entries = [
-        ("A", "target_augmented", target),
-        ("B", "prediction", pred),
+        ("A", target_label, target),
+        ("B", pred_label, pred),
     ]
     if noisy is not None:
         entries.append(("C", "noisy_input", noisy))
 
     lines = [
-        "REMARK raw denoise overlay; coordinates are not Kabsch aligned",
-        "REMARK chain A target_augmented",
-        "REMARK chain B prediction",
+        f"REMARK {remark}",
+        f"REMARK chain A {target_label}",
+        f"REMARK chain B {pred_label}",
     ]
     if noisy is not None:
         lines.append("REMARK chain C noisy_input")
@@ -1196,6 +1251,16 @@ def append_probe_row(path: Path, row: dict):
         writer.writerow({key: row.get(key, "") for key in DENOISE_PROBE_FIELDS})
 
 
+def append_full_inference_row(path: Path, row: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FULL_INFERENCE_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in FULL_INFERENCE_FIELDS})
+
+
 def mean_numeric(rows: list[dict], key: str) -> float | str:
     values = [
         float(row[key])
@@ -1210,6 +1275,80 @@ def mean_numeric(rows: list[dict], key: str) -> float | str:
 def write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, default=str) + "\n")
+
+
+def run_full_inference_probe_item(
+    model,
+    features: dict,
+    extra: dict,
+    info: dict,
+    args: argparse.Namespace,
+    device: torch.device,
+    probe_dir: Path,
+    step_dir: Path,
+    epoch: int,
+    step: int,
+    item_idx: int,
+) -> dict:
+    if not args.denoise_probe_full_inference:
+        return {}
+
+    inference_extra = {
+        "x_t": extra["x_t"],
+        "dt": extra["dt"],
+    }
+    with fork_validation_rng(device):
+        torch.manual_seed(args.denoise_probe_seed + 200_000 + item_idx)
+        out = model.forward_train(
+            **features,
+            **inference_extra,
+            num_loops=args.num_loops,
+            num_sampling_steps=args.denoise_probe_full_inference_steps,
+        )
+
+    pred = out.get("sample_atom_coords")
+    if pred is None:
+        raise RuntimeError("full inference probe expected sample_atom_coords")
+    target = extra["target_atom_coords"]
+    mask = extra["target_atom_mask"].bool()
+    pred_aligned = kabsch_align_to_target(pred, target, mask)
+
+    row = {
+        "epoch": epoch,
+        "step": step,
+        "domain": info["domain"],
+        "temperature": info["temperature"],
+        "run": info["run"],
+        "frame": info["frame"],
+        "dt_seconds": info["dt_seconds"],
+        "num_sampling_steps": args.denoise_probe_full_inference_steps,
+        "sequence_length": info["sequence_length"],
+        "valid_atoms": int(mask.float().sum().detach().cpu()),
+        "rmsd_unaligned": masked_rmsd_value(pred, target, mask),
+        "rmsd_kabsch": masked_rmsd_value(pred_aligned, target, mask),
+        "pred_rg": radius_of_gyration_value(pred_aligned, mask),
+        "target_rg": radius_of_gyration_value(target, mask),
+        **probe_geometry_metrics(pred_aligned, features, mask),
+    }
+    append_full_inference_row(probe_dir / "full_inference_metrics.csv", row)
+
+    if args.denoise_probe_write_pdbs:
+        domain_dir = step_dir / denoise_probe_domain_dir_name(info["domain"])
+        domain_dir.mkdir(parents=True, exist_ok=True)
+        write_probe_overlay_pdb(
+            domain_dir / "full_inference_overlay.pdb",
+            features,
+            target,
+            pred_aligned,
+            mask,
+            target_label="run_frame0_target",
+            pred_label="full_inference_prediction_kabsch",
+            remark=(
+                "full inference overlay; chain B is Kabsch aligned to chain A"
+            ),
+        )
+
+    return row
 
 
 @torch.no_grad()
@@ -1229,12 +1368,29 @@ def run_denoise_probe(
     step_dir = probe_dir / f"step_{step}"
     step_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
+    full_inference_rows: list[dict] = []
     probe_sigmas = parse_denoise_probe_sigmas(args.denoise_probe_sigmas, model, device)
 
     for item_idx, (features, extra, info) in enumerate(probe_items):
         with fork_validation_rng(device):
             torch.manual_seed(args.denoise_probe_seed + 100_000 + item_idx)
             fixed_noise = torch.randn_like(extra["target_atom_coords"])
+
+        full_row = run_full_inference_probe_item(
+            model,
+            features,
+            extra,
+            info,
+            args,
+            device,
+            probe_dir,
+            step_dir,
+            epoch,
+            step,
+            item_idx,
+        )
+        if full_row:
+            full_inference_rows.append(full_row)
 
         for sigma in probe_sigmas:
             extra_probe = dict(extra)
@@ -1345,6 +1501,27 @@ def run_denoise_probe(
         "local_bond_bad": sum(int(row["local_bond_bad"]) for row in rows),
         "local_bond_total": sum(int(row["local_bond_total"]) for row in rows),
     }
+    if full_inference_rows:
+        summary["full_inference"] = {
+            "num_sampling_steps": args.denoise_probe_full_inference_steps,
+            "mean_rmsd_unaligned": mean_numeric(
+                full_inference_rows, "rmsd_unaligned"
+            ),
+            "mean_rmsd_kabsch": mean_numeric(
+                full_inference_rows, "rmsd_kabsch"
+            ),
+            "local_bond_bad": sum(
+                int(row["local_bond_bad"]) for row in full_inference_rows
+            ),
+            "local_bond_total": sum(
+                int(row["local_bond_total"]) for row in full_inference_rows
+            ),
+        }
+        if summary["full_inference"]["local_bond_total"]:
+            summary["full_inference"]["local_bond_bad_fraction"] = (
+                summary["full_inference"]["local_bond_bad"]
+                / summary["full_inference"]["local_bond_total"]
+            )
     if summary["local_bond_total"]:
         summary["local_bond_bad_fraction"] = (
             summary["local_bond_bad"] / summary["local_bond_total"]
@@ -1455,6 +1632,20 @@ def load_model(args: argparse.Namespace, device: torch.device):
     return model
 
 
+def zero_and_freeze_dt_encoder(model) -> int:
+    dt_encoder = getattr(getattr(model, "md_conditioning", None), "dt_encoder", None)
+    if dt_encoder is None:
+        raise RuntimeError("Expected model.md_conditioning.dt_encoder")
+
+    param_count = 0
+    with torch.no_grad():
+        for param in dt_encoder.parameters():
+            param.zero_()
+            param.requires_grad_(False)
+            param_count += param.numel()
+    return param_count
+
+
 def main() -> int:
     args = parse_args()
     random.seed(args.seed)
@@ -1495,6 +1686,9 @@ def main() -> int:
         param.requires_grad_(False)
     for param in model.md_conditioning.parameters():
         param.requires_grad_(True)
+    frozen_dt_params = 0
+    if args.freeze_zero_dt_encoder:
+        frozen_dt_params = zero_and_freeze_dt_encoder(model)
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     if not trainable_params:
         raise RuntimeError("No trainable parameters found after enabling md_conditioning")
@@ -1505,6 +1699,11 @@ def main() -> int:
         f"trainable_params={trainable_count} total_params={total_count} "
         "trainable_module=md_conditioning"
     )
+    if args.freeze_zero_dt_encoder:
+        print(
+            "dt_encoder_zero_frozen=true "
+            f"frozen_dt_params={frozen_dt_params}"
+        )
     print(
         f"records train={len(train_records)} validation={len(val_records)} "
         f"validation_every={args.val_every}"
@@ -1519,6 +1718,8 @@ def main() -> int:
         start_epoch, global_step = load_training_checkpoint(
             args.resume_checkpoint, model, optimizer, device
         )
+        if args.freeze_zero_dt_encoder:
+            zero_and_freeze_dt_encoder(model)
         print(
             f"resumed_checkpoint={args.resume_checkpoint} "
             f"start_epoch={start_epoch} global_step={global_step}"
@@ -1554,6 +1755,14 @@ def main() -> int:
                 "delta_frames": args.denoise_probe_delta_frames,
                 "dt_seconds": args.denoise_probe_delta_frames * args.frame_time_ns * 1e-9,
                 "sigmas": parse_denoise_probe_sigmas(args.denoise_probe_sigmas, model, device),
+                "full_inference": {
+                    "enabled": args.denoise_probe_full_inference,
+                    "num_sampling_steps": args.denoise_probe_full_inference_steps,
+                    "overlay": (
+                        "full_inference_overlay.pdb contains chain A run_frame0_target "
+                        "and chain B Kabsch-aligned full_inference_prediction"
+                    ),
+                },
                 "seed": args.denoise_probe_seed,
                 "write_pdbs": args.denoise_probe_write_pdbs,
                 "note": (
