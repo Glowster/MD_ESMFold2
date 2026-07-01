@@ -48,6 +48,30 @@ def write_csv(path: Path, row: dict) -> None:
         writer.writerow(row)
 
 
+def append_multimodel_pdb(
+    path: Path,
+    model_number: int,
+    features: dict,
+    coords: torch.Tensor,
+    atom_mask: torch.Tensor,
+) -> None:
+    if not path.exists():
+        path.write_text(
+            "REMARK autoregressive full-inference rollout trajectory\n"
+            "REMARK one MODEL record per rollout step\n"
+            "REMARK coordinates are Kabsch aligned to run 1 frame 0 for viewing\n"
+        )
+    pdb_text = train.output_to_pdb(
+        train.probe_output_to_pdb_dict(features, coords, atom_mask)
+    )
+    atom_lines, _ = train.pdb_atom_lines_with_chain(pdb_text, "B", 1)
+    with path.open("a") as handle:
+        handle.write(f"MODEL     {model_number:4d}\n")
+        for line in atom_lines:
+            handle.write(line + "\n")
+        handle.write("ENDMDL\n")
+
+
 def load_probe_batch(args: argparse.Namespace, device: torch.device):
     helper_args = SimpleNamespace(
         model=args.model,
@@ -112,7 +136,7 @@ def main() -> int:
     dt = extras["dt"]
 
     for step in range(1, args.rollout_steps + 1):
-        with train.fork_validation_rng(device):
+        with torch.inference_mode(), train.fork_validation_rng(device):
             torch.manual_seed(args.seed + step)
             out = model.forward_train(
                 **features,
@@ -144,9 +168,24 @@ def main() -> int:
             }
             write_csv(out_dir / "metrics.csv", row)
 
+            domain_dir = out_dir / f"{info['domain']}"
+            domain_dir.mkdir(parents=True, exist_ok=True)
+            if step == 1:
+                train.write_probe_pdb(
+                    domain_dir / "run1_frame0_target.pdb",
+                    features_i,
+                    target_i,
+                    mask_i,
+                )
+            append_multimodel_pdb(
+                domain_dir / "rollout_predictions_kabsch_multimodel.pdb",
+                step,
+                features_i,
+                aligned_i,
+                mask_i,
+            )
+
             if step == 1 or step % args.write_every == 0 or step == args.rollout_steps:
-                domain_dir = out_dir / f"{info['domain']}"
-                domain_dir.mkdir(parents=True, exist_ok=True)
                 train.write_probe_overlay_pdb(
                     domain_dir / f"rollout_step_{step:04d}_overlay.pdb",
                     features_i,
