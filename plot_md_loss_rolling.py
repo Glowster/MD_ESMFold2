@@ -15,6 +15,7 @@ import argparse
 import csv
 import html
 import math
+import statistics
 from pathlib import Path
 
 
@@ -28,6 +29,7 @@ def parse_args() -> argparse.Namespace:
         help="Run folder name under ./runs, or an explicit path to a run folder.",
     )
     parser.add_argument("--window", type=int, default=50)
+    parser.add_argument("--stat", choices=["mean", "median"], default="mean")
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -76,11 +78,26 @@ def rolling_mean(values: list[float], window: int) -> list[float | None]:
         running += value
         if i >= window:
             running -= values[i - window]
-        if i + 1 >= window:
-            out.append(running / window)
-        else:
-            out.append(None)
+        out.append(running / min(i + 1, window))
     return out
+
+
+def rolling_median(values: list[float], window: int) -> list[float | None]:
+    if window <= 0:
+        raise ValueError("--window must be positive")
+    out: list[float | None] = []
+    for i in range(len(values)):
+        start = max(0, i + 1 - window)
+        out.append(statistics.median(values[start : i + 1]))
+    return out
+
+
+def rolling_stat(values: list[float], window: int, stat: str) -> list[float | None]:
+    if stat == "mean":
+        return rolling_mean(values, window)
+    if stat == "median":
+        return rolling_median(values, window)
+    raise ValueError(f"unsupported rolling stat: {stat}")
 
 
 def align_series(
@@ -115,6 +132,7 @@ def polyline(
     color: str,
     width: float,
     opacity: float = 1.0,
+    dasharray: str | None = None,
 ) -> str:
     points = [
         f"{x_map(x):.2f},{y_map(y):.2f}"
@@ -123,25 +141,43 @@ def polyline(
     ]
     if len(points) < 2:
         return ""
+    dash = f' stroke-dasharray="{html.escape(dasharray)}"' if dasharray else ""
     return (
         f'<polyline fill="none" stroke="{color}" stroke-width="{width}" '
-        f'stroke-opacity="{opacity}" points="{" ".join(points)}" />'
+        f'stroke-opacity="{opacity}"{dash} points="{" ".join(points)}" />'
     )
+
+
+def markers(
+    xs: list[float],
+    ys: list[float | None],
+    x_map,
+    y_map,
+    color: str,
+) -> str:
+    points = [
+        f'<circle cx="{x_map(x):.2f}" cy="{y_map(y):.2f}" r="3.2" '
+        f'fill="white" stroke="{color}" stroke-width="1.7" />'
+        for x, y in zip(xs, ys)
+        if y is not None and math.isfinite(y)
+    ]
+    return "\n".join(points)
 
 
 def render_panel(
     *,
     title: str,
     x_values: list[float],
-    series: list[tuple[str, list[float | None], str, float]],
+    series: list[tuple[str, list[float | None], str, float, str | None]],
     x: int,
     y: int,
     width: int,
     height: int,
+    subtitle: str | None = None,
 ) -> str:
     finite_values = [
         value
-        for _, ys, _, _ in series
+        for _, ys, _, _, _ in series
         for value in ys
         if value is not None and math.isfinite(value)
     ]
@@ -159,8 +195,22 @@ def render_panel(
 
     left = x + 74
     right = x + width - 26
+    available_legend_width = max(240, right - left)
+    legend_rows: list[list[tuple[str, list[float | None], str, float, str | None, float]]] = [[]]
+    current_width = 0.0
+    for entry in series:
+        label = entry[0]
+        entry_width = 64 + max(88, len(label) * 7.4)
+        if legend_rows[-1] and current_width + entry_width > available_legend_width:
+            legend_rows.append([])
+            current_width = 0.0
+        legend_rows[-1].append((*entry, entry_width))
+        current_width += entry_width
+
+    legend_row_height = 18
+    legend_top = y + height - 6 - legend_row_height * len(legend_rows)
     top = y + 42
-    bottom = y + height - 58
+    bottom = legend_top - 34
 
     def x_map(value: float) -> float:
         if xmin == xmax:
@@ -175,6 +225,11 @@ def render_panel(
         f'<line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" class="axis" />',
         f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" class="axis" />',
     ]
+    if subtitle:
+        parts.insert(
+            1,
+            f'<text x="{x}" y="{y + 36}" class="subtitle">{html.escape(subtitle)}</text>',
+        )
 
     for tick in nice_ticks(ymin, ymax):
         yy = y_map(tick)
@@ -193,19 +248,25 @@ def render_panel(
             f"{tick:.0f}</text>"
         )
 
-    legend_x = left
-    legend_y = y + height - 18
-    for label, ys, color, stroke_width in series:
-        parts.append(
-            f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 24}" '
-            f'y2="{legend_y}" stroke="{color}" stroke-width="{stroke_width}" />'
-        )
-        parts.append(
-            f'<text x="{legend_x + 32}" y="{legend_y + 4}" class="legend">'
-            f"{html.escape(label)}</text>"
-        )
-        legend_x += 190
-        parts.append(polyline(x_values, ys, x_map, y_map, color, stroke_width))
+    for label, ys, color, stroke_width, dasharray in series:
+        parts.append(polyline(x_values, ys, x_map, y_map, color, stroke_width, dasharray=dasharray))
+        if dasharray:
+            parts.append(markers(x_values, ys, x_map, y_map, color))
+
+    for row_idx, row in enumerate(legend_rows):
+        legend_x = left
+        legend_y = legend_top + row_idx * legend_row_height + 10
+        for label, _ys, color, stroke_width, dasharray, entry_width in row:
+            dash = f' stroke-dasharray="{html.escape(dasharray)}"' if dasharray else ""
+            parts.append(
+                f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 24}" '
+                f'y2="{legend_y}" stroke="{color}" stroke-width="{stroke_width}"{dash} />'
+            )
+            parts.append(
+                f'<text x="{legend_x + 32}" y="{legend_y + 4}" class="legend">'
+                f"{html.escape(label)}</text>"
+            )
+            legend_x += entry_width
 
     return "\n".join(parts)
 
@@ -215,6 +276,7 @@ def write_svg(
     run_name: str,
     rows: list[dict[str, str]],
     window: int,
+    stat: str,
     validation_rows: list[dict[str, str]] | None = None,
 ) -> None:
     steps = numeric_column(rows, "step")
@@ -229,19 +291,20 @@ def write_svg(
     else:
         x_values = steps
 
-    loss_roll = rolling_mean(losses, window)
-    loss_series = [(f"train loss rolling-{window}", align_series(x_values, steps, loss_roll), "#0f766e", 2.6)]
+    stat_label = f"rolling {stat}"
+    loss_roll = rolling_stat(losses, window, stat)
+    loss_series = [(f"train loss {stat_label}-{window}", align_series(x_values, steps, loss_roll), "#0f766e", 2.6, None)]
 
     if validation_steps is not None:
         validation_losses = numeric_column(validation_rows, "loss")
         if validation_losses is not None:
             val_loss_series = align_series(x_values, validation_steps, validation_losses)
             if has_finite(val_loss_series):
-                loss_series.append(("validation loss", val_loss_series, "#f97316", 2.4))
+                loss_series.append(("validation loss", val_loss_series, "#f97316", 2.4, "5 5"))
 
     panels = [
         render_panel(
-            title=f"{run_name}: loss ({window}-step rolling average)",
+            title=f"{run_name}: loss ({window}-step {stat_label})",
             x_values=x_values,
             series=loss_series,
             x=44,
@@ -251,28 +314,26 @@ def write_svg(
         )
     ]
 
-    rmsd_series: list[tuple[str, list[float | None], str, float]] = []
-    for key, color in (("denoise_rmsd", "#2563eb"), ("noisy_rmsd", "#dc2626")):
-        values = numeric_column(rows, key)
-        if values is not None:
-            rolled = align_series(x_values, steps, rolling_mean(values, window))
-            if has_finite(rolled):
-                rmsd_series.append((f"train {key} rolling-{window}", rolled, color, 2.4))
+    denoise_series: list[tuple[str, list[float | None], str, float, str | None]] = []
+    values = numeric_column(rows, "denoise_rmsd")
+    if values is not None:
+        rolled = align_series(x_values, steps, rolling_stat(values, window, stat))
+        if has_finite(rolled):
+            denoise_series.append((f"train denoised RMSD {stat_label}-{window}", rolled, "#2563eb", 2.4, None))
 
     if validation_steps is not None:
-        for key, color in (("denoise_rmsd", "#7c3aed"), ("noisy_rmsd", "#ea580c")):
-            values = numeric_column(validation_rows, key)
-            if values is not None:
-                aligned = align_series(x_values, validation_steps, values)
-                if has_finite(aligned):
-                    rmsd_series.append((f"validation {key}", aligned, color, 2.3))
+        values = numeric_column(validation_rows, "denoise_rmsd")
+        if values is not None:
+            aligned = align_series(x_values, validation_steps, values)
+            if has_finite(aligned):
+                denoise_series.append(("validation denoised RMSD", aligned, "#7c3aed", 2.3, "5 5"))
 
-    if rmsd_series:
+    if denoise_series:
         panels.append(
             render_panel(
-                title=f"{run_name}: RMSD diagnostics ({window}-step rolling average)",
+                title=f"{run_name}: denoised prediction RMSD ({window}-step {stat_label})",
                 x_values=x_values,
-                series=rmsd_series,
+                series=denoise_series,
                 x=44,
                 y=400,
                 width=1120,
@@ -280,10 +341,39 @@ def write_svg(
             )
         )
 
-    height = 760 if rmsd_series else 420
+    noise_series: list[tuple[str, list[float | None], str, float, str | None]] = []
+    values = numeric_column(rows, "noise_sigma_mean")
+    if values is not None:
+        rolled = align_series(x_values, steps, rolling_stat(values, window, stat))
+        if has_finite(rolled):
+            noise_series.append((f"train mean sigma_i {stat_label}-{window}", rolled, "#64748b", 2.4, None))
+
+    if validation_steps is not None:
+        values = numeric_column(validation_rows, "noise_sigma_mean")
+        if values is not None:
+            aligned = align_series(x_values, validation_steps, values)
+            if has_finite(aligned):
+                noise_series.append(("validation mean sigma_i", aligned, "#475569", 2.3, "5 5"))
+
+    if noise_series:
+        panels.append(
+            render_panel(
+                title=f"{run_name}: sampled noise scale ({window}-step {stat_label})",
+                subtitle="Plotted value is mean sigma_i. Expected coordinate RMSD of the raw Gaussian corruption is about sqrt(3) * sigma_i.",
+                x_values=x_values,
+                series=noise_series,
+                x=44,
+                y=748,
+                width=1120,
+                height=310,
+            )
+        )
+
+    height = 420 + 348 * (len(panels) - 1)
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="{height}" viewBox="0 0 1200 {height}">
 <style>
   .title {{ font: 700 18px sans-serif; fill: #111827; }}
+  .subtitle {{ font: 13px sans-serif; fill: #475569; }}
   .axis {{ stroke: #111827; stroke-width: 1.2; }}
   .grid {{ stroke: #e5e7eb; stroke-width: 1; }}
   .tick {{ font: 12px sans-serif; fill: #374151; }}
@@ -310,10 +400,13 @@ def main() -> int:
     validation_csv = run_dir / "validation.csv"
     validation_rows = read_rows(validation_csv) if validation_csv.exists() else []
 
-    output = args.output or run_dir / f"loss_rolling{args.window}.svg"
+    default_name = f"loss_rolling{args.window}.svg"
+    if args.stat != "mean":
+        default_name = f"loss_rolling{args.window}_{args.stat}.svg"
+    output = args.output or run_dir / default_name
     if not output.is_absolute():
         output = run_dir / output
-    write_svg(output, run_dir.name, rows, args.window, validation_rows=validation_rows)
+    write_svg(output, run_dir.name, rows, args.window, args.stat, validation_rows=validation_rows)
     print(output)
     return 0
 

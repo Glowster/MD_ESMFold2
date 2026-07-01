@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import random
@@ -90,6 +91,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="biohub/ESMFold2")
     parser.add_argument("--esmc-model", type=Path, default=None)
     parser.add_argument("--esmc-precision", choices=["auto", "bf16", "fp32", "fp8"], default="auto")
+    parser.add_argument("--lm-z-cache-dir", type=Path, default=None, help="directory containing precomputed ESM-C lm_z cache")
+    parser.add_argument("--require-lm-z-cache", action="store_true", help="require cached lm_z for every record and do not load ESM-C")
+    parser.add_argument("--precomputed-lm-z-only", action="store_true", help="strict cache-only mode; implies --require-lm-z-cache")
+    parser.add_argument("--lm-z-cache-dtype", choices=["auto", "bf16", "fp32"], default="auto", help="dtype to cast cached lm_z tensors before model forward")
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data" / "mdcath_320K_len_le200" / "data")
     parser.add_argument("--out-dir", type=Path, default=ROOT / "runs")
     parser.add_argument("--temperature", default="320")
@@ -155,6 +160,101 @@ def as_text(value) -> str:
     if isinstance(value, list):
         return "".join(as_text(v) for v in value)
     return str(value)
+
+
+def sequence_sha256(sequence: str) -> str:
+    return hashlib.sha256(sequence.encode("utf-8")).hexdigest()
+
+
+def load_lm_z_cache_index(cache_dir: Path) -> dict[str, dict]:
+    index_path = cache_dir / "index.jsonl"
+    if not index_path.exists():
+        raise FileNotFoundError(f"lm_z cache index not found: {index_path}")
+
+    by_sequence_sha256: dict[str, dict] = {}
+    by_domain: dict[str, dict] = {}
+    for line_no, line in enumerate(index_path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        seq_hash = row.get("sequence_sha256")
+        domain = row.get("domain")
+        rel_path = row.get("relative_tensor_path")
+        if not seq_hash or not rel_path:
+            raise ValueError(
+                f"invalid lm_z cache index row {line_no} in {index_path}: "
+                "expected sequence_sha256 and relative_tensor_path"
+            )
+        by_sequence_sha256[seq_hash] = row
+        if domain:
+            by_domain[domain] = row
+
+    return {
+        "by_sequence_sha256": by_sequence_sha256,
+        "by_domain": by_domain,
+    }
+
+
+def cached_lm_z_dtype(value: str) -> torch.dtype | None:
+    if value == "auto":
+        return None
+    if value == "bf16":
+        return torch.bfloat16
+    if value == "fp32":
+        return torch.float32
+    raise ValueError(f"unsupported lm_z cache dtype: {value}")
+
+
+def load_cached_lm_z(record: dict, sequence: str, args: argparse.Namespace, device: torch.device) -> torch.Tensor | None:
+    cache_dir = getattr(args, "lm_z_cache_dir", None)
+    if cache_dir is None:
+        return None
+
+    index = getattr(args, "_lm_z_cache_index", None)
+    if index is None:
+        raise RuntimeError("lm_z cache index was not loaded")
+
+    seq_hash = sequence_sha256(sequence)
+    row = index["by_sequence_sha256"].get(seq_hash)
+    if row is None:
+        row = index["by_domain"].get(record["domain"])
+    if row is None:
+        if getattr(args, "require_lm_z_cache", False):
+            raise FileNotFoundError(
+                f"missing lm_z cache entry for domain={record['domain']} "
+                f"sequence_sha256={seq_hash}"
+            )
+        return None
+
+    tensor_path = Path(row["relative_tensor_path"])
+    if not tensor_path.is_absolute():
+        tensor_path = cache_dir / tensor_path
+    if not tensor_path.exists():
+        raise FileNotFoundError(f"cached lm_z tensor not found: {tensor_path}")
+
+    try:
+        from safetensors.torch import load_file
+    except ImportError as err:
+        raise RuntimeError(
+            "Install safetensors or disable --lm-z-cache-dir before training"
+        ) from err
+
+    tensors = load_file(str(tensor_path), device="cpu")
+    if "lm_z" not in tensors:
+        raise KeyError(f"{tensor_path} does not contain tensor 'lm_z'")
+
+    lm_z = tensors["lm_z"]
+    expected_length = len(sequence)
+    if lm_z.shape[:2] != (expected_length, expected_length) or lm_z.dim() != 3:
+        raise ValueError(
+            f"cached lm_z for {record['domain']} has shape {tuple(lm_z.shape)}, "
+            f"expected ({expected_length}, {expected_length}, d_pair)"
+        )
+
+    dtype = cached_lm_z_dtype(getattr(args, "lm_z_cache_dtype", "auto"))
+    if dtype is not None:
+        lm_z = lm_z.to(dtype=dtype)
+    return lm_z.unsqueeze(0).to(device=device)
 
 
 def domain_from_path(path: Path) -> str:
@@ -325,6 +425,21 @@ def split_train_validation_records(records: list[dict], args: argparse.Namespace
     train_records = [record for record in records if record["cluster"] not in val_clusters]
     val_records = [record for record in records if record["cluster"] in val_clusters]
     return train_records, val_records
+
+
+def assert_forced_validation_domains_not_in_train(
+    train_records: list[dict], args: argparse.Namespace
+) -> None:
+    forced_domains = set(forced_validation_domains(args))
+    if not forced_domains:
+        return
+    train_domains = {record["domain"] for record in train_records}
+    leaked_domains = sorted(forced_domains & train_domains)
+    if leaked_domains:
+        raise RuntimeError(
+            "forced validation domains leaked into training records: "
+            + ",".join(leaked_domains)
+        )
 
 
 def find_axis(shape: tuple[int, ...], size: int, name: str) -> int:
@@ -508,6 +623,9 @@ def tensorize_record(record: dict, args: argparse.Namespace, feature_cache: dict
         feature_cache[sequence] = prepare_protein_features(sequence)
 
     features = {k: v.to(device) for k, v in feature_cache[sequence].items()}
+    lm_z = load_cached_lm_z(record, sequence, args, device)
+    if lm_z is not None:
+        features["lm_z"] = lm_z
     atom_count = features["ref_pos"].shape[1]
     feature_to_md_atom = feature_to_md_atom_indices(sequence, pdb_text, atom_count)
 
@@ -579,6 +697,7 @@ def pad_features(feature_list: list[dict]) -> dict:
         "atom_to_token",
     }
     msa_keys = {"msa", "msa_attention_mask", "has_deletion", "deletion_value"}
+    pair_keys = {"lm_z"}
 
     batched = {}
     for key in feature_list[0].keys():
@@ -589,6 +708,8 @@ def pad_features(feature_list: list[dict]) -> dict:
                 shape = (1, max_l)
             elif key == "token_bonds":
                 shape = (1, max_l, max_l, 1)
+            elif key in pair_keys:
+                shape = (1, max_l, max_l, x.shape[-1])
             elif key in msa_keys:
                 shape = (1, x.shape[1], max_l)
             elif key == "ref_pos":
@@ -629,6 +750,21 @@ def tensorize_batch(records: list[dict], args: argparse.Namespace, feature_cache
         extra_list.append(extra)
         infos.append(info)
 
+    lm_z_hits = ["lm_z" in features for features in feature_list]
+    if any(lm_z_hits) and not all(lm_z_hits):
+        if getattr(args, "require_lm_z_cache", False):
+            missing = [
+                info["domain"]
+                for hit, info in zip(lm_z_hits, infos)
+                if not hit
+            ]
+            raise FileNotFoundError(
+                "missing lm_z cache entries in required-cache batch: "
+                + ",".join(missing)
+            )
+        for features in feature_list:
+            features.pop("lm_z", None)
+
     features = pad_features(feature_list)
     extra = pad_extras(extra_list)
     info = {
@@ -636,6 +772,7 @@ def tensorize_batch(records: list[dict], args: argparse.Namespace, feature_cache
         "max_length": max(r["length"] for r in records),
         "domains": ";".join(i["domain"] for i in infos),
         "mean_dt_seconds": sum(i["dt_seconds"] for i in infos) / len(infos),
+        "lm_z_cache": "hit" if all(lm_z_hits) else "miss",
     }
     return features, extra, info
 
@@ -1563,7 +1700,12 @@ def tree_to_cpu(value):
 
 
 def serializable_args(args: argparse.Namespace) -> dict:
-    result = json.loads(json.dumps(vars(args), default=str))
+    public_args = {
+        key: value
+        for key, value in vars(args).items()
+        if not key.startswith("_")
+    }
+    result = json.loads(json.dumps(public_args, default=str))
     #Diagnostics: This metadata makes x_t -> x_t runs explicit in args.json/checkpoints; remove this block when removing --target-current-frame.
     if result.get("target_current_frame"):
         result["diagnostic_target"] = "target_atom_coords = x_t (current input frame), not x_t+dt"
@@ -1622,6 +1764,10 @@ def resolve_esmc_precision(device: torch.device, requested: str) -> str:
 
 def load_model(args: argparse.Namespace, device: torch.device):
     esmc_precision = resolve_esmc_precision(device, args.esmc_precision)
+    if args.require_lm_z_cache or args.precomputed_lm_z_only:
+        model = ESMFold2Model.from_pretrained(args.model, load_esmc=False)
+        return model.to(device)
+
     if args.esmc_model is None:
         model = ESMFold2Model.from_pretrained(args.model, esmc_precision=esmc_precision)
         return model.to(device)
@@ -1648,11 +1794,21 @@ def zero_and_freeze_dt_encoder(model) -> int:
 
 def main() -> int:
     args = parse_args()
+    if args.precomputed_lm_z_only:
+        args.require_lm_z_cache = True
+    if args.require_lm_z_cache and args.lm_z_cache_dir is None:
+        raise RuntimeError("--require-lm-z-cache requires --lm-z-cache-dir")
+    if args.lm_z_cache_dir is not None:
+        args._lm_z_cache_index = load_lm_z_cache_index(args.lm_z_cache_dir)
+    else:
+        args._lm_z_cache_index = None
+
     random.seed(args.seed)
     device = torch.device(args.device)
 
     records = load_domain_records(args.data_dir, args.temperature)
     train_records, val_records = split_train_validation_records(records, args)
+    assert_forced_validation_domains_not_in_train(train_records, args)
     if not train_records:
         raise RuntimeError("validation split left no training records")
 
