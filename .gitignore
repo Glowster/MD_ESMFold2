@@ -11,6 +11,7 @@
 !*.py
 !**/*.py
 !MODELING_ESMFOLD2_MD_CHANGES.md
+!ideas/*.md
 
 # Keep generated Python artifacts out.
 __pycache__/

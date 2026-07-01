@@ -33,8 +33,10 @@ sys.path.insert(0, str(LOCAL_TRANSFORMERS))
 
 from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model  # noqa: E402
 from transformers.models.esmfold2.protein_utils import (  # noqa: E402
+    OUTPUT_TO_PDB_FEATURE_KEYS,
     PROTEIN_1TO3,
     PROTEIN_HEAVY_ATOMS,
+    output_to_pdb,
     prepare_protein_features,
 )
 
@@ -54,6 +56,33 @@ RESIDUE_NAME_ALIASES = {
 ATOM_NAME_ALIASES = {
     ("ILE", "CD1"): ("CD",),
 }
+
+DEFAULT_FORCE_VAL_DOMAINS = (
+    "1balA00",
+    "1bbyA00",
+    "1bhuA00",
+    "1ux6A01",
+    "4bxpA00",
+    "3euhA02",
+    "4ydzA00",
+    "1y1uA01",
+    "1zvuA03",
+    "1vwxQ00",
+    "3eo5A01",
+    "1vw4K00",
+    "1ytzT00",
+)
+
+DEFAULT_DENOISE_PROBE_DOMAINS = (
+    "1ux6A01",
+    "1vw4K00",
+    "1vwxQ00",
+    "1balA00",
+    "1bbyA00",
+    "1bhuA00",
+)
+
+DEFAULT_DENOISE_PROBE_DISORDED_DOMAINS = DEFAULT_DENOISE_PROBE_DOMAINS[:3]
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,6 +115,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.05)
     parser.add_argument("--val-length-max", type=int, default=None)
     parser.add_argument("--val-seed", type=int, default=12345)
+    parser.add_argument("--force-val-domains", default=",".join(DEFAULT_FORCE_VAL_DOMAINS), help="comma-separated domains whose clusters are always assigned to validation")
+    parser.add_argument("--force-val-domains-file", type=Path, default=None, help="optional newline-delimited domains whose clusters are always assigned to validation")
+    parser.add_argument("--denoise-probe-every", type=int, default=0, help="run fixed x_t -> x_t denoising probe every N optimizer steps; 0 disables")
+    parser.add_argument("--denoise-probe-domains", type=int, default=10, help="fallback number of sorted validation domains in the fixed denoising probe when --denoise-probe-domain-list is empty")
+    parser.add_argument("--denoise-probe-domain-list", default=",".join(DEFAULT_DENOISE_PROBE_DOMAINS), help="comma-separated validation domains to use for the fixed denoising probe; empty falls back to --denoise-probe-domains")
+    parser.add_argument("--denoise-probe-run", default="1", help="HDF5 run/replica key for the fixed denoising probe")
+    parser.add_argument("--denoise-probe-frame", type=int, default=0, help="frame index for the fixed denoising probe")
+    parser.add_argument("--denoise-probe-delta-frames", type=int, default=1, help="sets dt for the fixed denoising probe")
+    parser.add_argument("--denoise-probe-sigmas", default="2,8,16,inference_start", help="comma-separated fixed denoising noise levels in Angstrom; use inference_start for the canonical first sampling sigma")
+    parser.add_argument("--denoise-probe-seed", type=int, default=24680, help="base RNG seed for deterministic probe noise/augmentation")
+    parser.add_argument("--denoise-probe-dir", default="denoise_probe", help="subdirectory under the run directory for probe outputs")
+    parser.add_argument("--denoise-probe-write-pdbs", action="store_true", help="write target/noisy/prediction PDB snapshots for each probe step")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -199,8 +240,52 @@ def make_smart_batches(records: list[dict], length_max: int, batch_exp: float, r
     return batches
 
 
+def parse_domain_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [
+        item.strip()
+        for item in value.replace("\n", ",").split(",")
+        if item.strip()
+    ]
+
+
+def unique_in_order(values: list[str]) -> list[str]:
+    seen = set()
+    unique_values = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique_values.append(value)
+    return unique_values
+
+
+def forced_validation_domains(args: argparse.Namespace) -> list[str]:
+    domains = parse_domain_list(getattr(args, "force_val_domains", ""))
+    path = getattr(args, "force_val_domains_file", None)
+    if path is not None:
+        domains.extend(
+            line.strip()
+            for line in path.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    return sorted(set(domains))
+
+
+def denoise_probe_domain_dir_name(domain: str) -> str:
+    if domain in DEFAULT_DENOISE_PROBE_DISORDED_DOMAINS:
+        return f"{domain}_disorded"
+    return domain
+
+
 def split_train_validation_records(records: list[dict], args: argparse.Namespace) -> tuple[list[dict], list[dict]]:
-    if args.val_every <= 0 or args.val_batches <= 0 or args.val_fraction <= 0:
+    validation_enabled = args.val_every > 0 and args.val_batches > 0
+    probe_enabled = (
+        getattr(args, "denoise_probe_every", 0) > 0
+        and getattr(args, "denoise_probe_domains", 0) > 0
+    )
+    if (not validation_enabled and not probe_enabled) or args.val_fraction <= 0:
         return records, []
 
     by_cluster: dict[str, list[dict]] = {}
@@ -216,6 +301,23 @@ def split_train_validation_records(records: list[dict], args: argparse.Namespace
     n_val = max(1, int(round(len(clusters) * args.val_fraction)))
     n_val = min(n_val, len(clusters) - 1)
     val_clusters = set(clusters[:n_val])
+
+    by_domain = {record["domain"]: record for record in records}
+    missing_forced = []
+    forced_clusters = set()
+    for domain in forced_validation_domains(args):
+        record = by_domain.get(domain)
+        if record is None:
+            missing_forced.append(domain)
+            continue
+        forced_clusters.add(record["cluster"])
+    if forced_clusters:
+        val_clusters.update(forced_clusters)
+    if missing_forced:
+        print(
+            "warning: forced validation domains not found in usable records: "
+            + ",".join(missing_forced)
+        )
 
     train_records = [record for record in records if record["cluster"] not in val_clusters]
     val_records = [record for record in records if record["cluster"] in val_clusters]
@@ -535,11 +637,403 @@ def tensorize_batch(records: list[dict], args: argparse.Namespace, feature_cache
     return features, extra, info
 
 
+DENOISE_PROBE_FIELDS = [
+    "epoch",
+    "step",
+    "domain",
+    "temperature",
+    "run",
+    "frame",
+    "dt_seconds",
+    "probe_sigma",
+    "sequence_length",
+    "valid_atoms",
+    "loss",
+    "noise_sigma_mean",
+    "model_denoise_rmsd",
+    "model_noisy_rmsd",
+    "pred_target_rmsd",
+    "noisy_target_rmsd",
+    "rmsd_improvement",
+    "pred_rg",
+    "target_rg",
+    "ca_ca_mean",
+    "ca_ca_min",
+    "ca_ca_max",
+    "local_bond_bad",
+    "local_bond_total",
+    "local_bond_bad_fraction",
+]
+
+
+def sorted_numeric_strings(values) -> list[str]:
+    return sorted(values, key=lambda value: int(value) if str(value).isdigit() else str(value))
+
+
+INFERENCE_START_SIGMA_ALIASES = {
+    "inference_start",
+    "sampling_start",
+    "sample_start",
+    "canonical",
+}
+
+
+def canonical_inference_start_sigma(model, device: torch.device) -> float:
+    structure_head = getattr(model, "structure_head", None)
+    if structure_head is None or not hasattr(structure_head, "inference_noise_schedule"):
+        raise RuntimeError("model does not expose structure_head.inference_noise_schedule")
+
+    schedule = structure_head.inference_noise_schedule(
+        getattr(structure_head, "inference_num_steps", None),
+        device,
+    )
+    max_inference_sigma = 256.0
+    schedule = schedule[schedule <= max_inference_sigma]
+    schedule = torch.cat(
+        [schedule.new_tensor([max_inference_sigma]), schedule],
+        dim=0,
+    )
+    return float(schedule[0].detach().cpu())
+
+
+def parse_denoise_probe_sigmas(value: str, model=None, device: torch.device | None = None) -> list[float]:
+    sigmas = []
+    for part in str(value).split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if item.lower() in INFERENCE_START_SIGMA_ALIASES:
+            if model is None or device is None:
+                raise ValueError(
+                    f"{item} can only be resolved after the model is loaded"
+                )
+            sigmas.append(canonical_inference_start_sigma(model, device))
+        else:
+            sigmas.append(float(item))
+    if not sigmas:
+        raise ValueError("--denoise-probe-sigmas must contain at least one value")
+    if any(sigma <= 0 for sigma in sigmas):
+        raise ValueError("--denoise-probe-sigmas values must be positive")
+    return sigmas
+
+
+def sigma_dir_name(sigma: float) -> str:
+    text = f"{float(sigma):g}".replace("-", "m").replace(".", "p")
+    return f"sigma_{text}"
+
+
+def tensorize_fixed_frame_record(
+    record: dict,
+    args: argparse.Namespace,
+    feature_cache: dict,
+    device: torch.device,
+) -> tuple[dict, dict, dict]:
+    h5py, _ = need_h5py()
+    path = record["path"]
+    domain = record["domain"]
+
+    with h5py.File(path, "r") as h5:
+        group = h5[domain]
+        sequence = record["sequence"]
+        temperature = args.temperature if args.temperature in group else sorted_numeric_strings(k for k in group if k.isdigit())[0]
+        if args.denoise_probe_run not in group[temperature]:
+            runs = sorted_numeric_strings(group[temperature].keys())
+            raise KeyError(
+                f"{domain} temperature {temperature} has no run {args.denoise_probe_run}; "
+                f"available runs: {runs}"
+            )
+        run = args.denoise_probe_run
+        run_group = group[temperature][run]
+
+        coords = run_group["coords"]
+        num_atoms = int(group.attrs["numProteinAtoms"])
+        num_frames = int(run_group.attrs.get("numFrames", coords.shape[-1]))
+        frame = int(args.denoise_probe_frame)
+        if frame < 0 or frame >= num_frames:
+            raise IndexError(
+                f"{domain} temperature {temperature} run {run} has {num_frames} frames; "
+                f"requested frame {frame}"
+            )
+        pdb_text = as_text(group["pdbProteinAtoms"][()])
+        pair = read_two_frames(coords, num_atoms, num_frames, frame, frame)
+
+    if sequence not in feature_cache:
+        feature_cache[sequence] = prepare_protein_features(sequence)
+
+    features = {k: v.to(device) for k, v in feature_cache[sequence].items()}
+    atom_count = features["ref_pos"].shape[1]
+    feature_to_md_atom = feature_to_md_atom_indices(sequence, pdb_text, atom_count)
+    current, valid_atoms = map_md_coords_to_features(pair[0], feature_to_md_atom)
+    current = center_masked(current, valid_atoms)
+    x_t = pad_atom_coords(current, atom_count, device)
+
+    atom_mask = torch.from_numpy(valid_atoms).to(device=device).unsqueeze(0)
+    atom_mask &= features["atom_attention_mask"]
+
+    dt_seconds = int(args.denoise_probe_delta_frames) * args.frame_time_ns * 1e-9
+    dt = torch.tensor([[dt_seconds]], dtype=torch.float32, device=device)
+
+    extra = {
+        "x_t": x_t,
+        "dt": dt,
+        "target_atom_coords": x_t.clone(),
+        "target_atom_mask": atom_mask,
+    }
+    info = {
+        "domain": domain,
+        "temperature": temperature,
+        "run": run,
+        "frame": frame,
+        "dt_seconds": dt_seconds,
+        "sequence_length": len(sequence),
+    }
+    return features, extra, info
+
+
+def build_denoise_probe_items(
+    val_records: list[dict],
+    args: argparse.Namespace,
+    feature_cache: dict,
+    device: torch.device,
+) -> list[tuple[dict, dict, dict]]:
+    if args.denoise_probe_every <= 0 or args.denoise_probe_domains <= 0:
+        return []
+    if not val_records:
+        raise RuntimeError(
+            "denoise probe needs validation records; keep --val-fraction > 0"
+        )
+
+    requested_domains = unique_in_order(
+        parse_domain_list(getattr(args, "denoise_probe_domain_list", ""))
+    )
+    records_by_domain = {record["domain"]: record for record in val_records}
+    if requested_domains:
+        missing_domains = [
+            domain
+            for domain in requested_domains
+            if domain not in records_by_domain
+        ]
+        if missing_domains:
+            raise RuntimeError(
+                "denoise probe domains are not in validation records: "
+                + ",".join(missing_domains)
+            )
+        records = [records_by_domain[domain] for domain in requested_domains]
+    else:
+        records = sorted(val_records, key=lambda record: record["domain"])
+        records = records[: args.denoise_probe_domains]
+
+    return [
+        tensorize_fixed_frame_record(record, args, feature_cache, device)
+        for record in records
+    ]
+
+
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     if pred.ndim == 4:
         pred = pred[:, 0]
     sq = (pred - target).square().sum(dim=-1)
     return (sq * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
+
+
+def squeeze_sample_coords(coords: torch.Tensor) -> torch.Tensor:
+    if coords.ndim == 4:
+        return coords[:, 0]
+    return coords
+
+
+def masked_rmsd_value(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
+    pred = squeeze_sample_coords(pred).float()
+    target = squeeze_sample_coords(target).float()
+    mask_f = mask.float()
+    sq = (pred - target).square().sum(dim=-1)
+    mse = (sq * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+    return math.sqrt(max(float(mse.detach().cpu()), 0.0))
+
+
+def radius_of_gyration_value(coords: torch.Tensor, mask: torch.Tensor) -> float:
+    coords = squeeze_sample_coords(coords).float()
+    mask_f = mask.float().unsqueeze(-1)
+    denom = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+    center = (coords * mask_f).sum(dim=1, keepdim=True) / denom
+    sq = ((coords - center).square().sum(dim=-1) * mask.float()).sum(dim=1)
+    rg = torch.sqrt(sq / mask.float().sum(dim=1).clamp_min(1.0))
+    return float(rg.detach().mean().cpu())
+
+
+def decode_ref_atom_name(chars) -> str:
+    return "".join(
+        chr(int(char) + 32) if int(char) != 0 else " "
+        for char in chars
+    ).strip()
+
+
+def probe_geometry_metrics(
+    coords: torch.Tensor,
+    features: dict,
+    atom_mask: torch.Tensor,
+) -> dict:
+    _, np = need_h5py()
+    coords_np = squeeze_sample_coords(coords)[0].detach().float().cpu().numpy()
+    atom_mask_np = atom_mask[0].detach().cpu().numpy().astype(bool)
+    atom_to_token = features["atom_to_token"][0].detach().cpu().numpy()
+    ref_chars = features["ref_atom_name_chars"][0].detach().cpu().numpy()
+
+    by_token: dict[int, dict[str, object]] = {}
+    for atom_idx, valid in enumerate(atom_mask_np):
+        if not valid:
+            continue
+        token_idx = int(atom_to_token[atom_idx])
+        name = decode_ref_atom_name(ref_chars[atom_idx])
+        by_token.setdefault(token_idx, {})[name] = coords_np[atom_idx]
+
+    local_checks = [
+        ("N", "CA", 1.46),
+        ("CA", "C", 1.53),
+        ("C", "O", 1.24),
+        ("CA", "CB", 1.53),
+    ]
+    bad_bonds = 0
+    total_bonds = 0
+    tolerance = 0.35
+    for atoms in by_token.values():
+        for name_a, name_b, ideal in local_checks:
+            if name_a not in atoms or name_b not in atoms:
+                continue
+            distance = float(np.linalg.norm(atoms[name_a] - atoms[name_b]))
+            total_bonds += 1
+            if abs(distance - ideal) > tolerance:
+                bad_bonds += 1
+
+    ca_coords = [
+        atoms["CA"]
+        for token_idx, atoms in sorted(by_token.items())
+        if "CA" in atoms
+    ]
+    ca_distances = [
+        float(np.linalg.norm(ca_coords[idx + 1] - ca_coords[idx]))
+        for idx in range(len(ca_coords) - 1)
+    ]
+
+    return {
+        "ca_ca_mean": sum(ca_distances) / len(ca_distances) if ca_distances else "",
+        "ca_ca_min": min(ca_distances) if ca_distances else "",
+        "ca_ca_max": max(ca_distances) if ca_distances else "",
+        "local_bond_bad": bad_bonds,
+        "local_bond_total": total_bonds,
+        "local_bond_bad_fraction": bad_bonds / total_bonds if total_bonds else "",
+    }
+
+
+def probe_output_to_pdb_dict(
+    features: dict,
+    coords: torch.Tensor,
+    atom_mask: torch.Tensor,
+) -> dict:
+    output = {"sample_atom_coords": squeeze_sample_coords(coords).detach().float().cpu()}
+    for key in OUTPUT_TO_PDB_FEATURE_KEYS:
+        value = features[key].detach().cpu()
+        if key == "atom_attention_mask":
+            value = atom_mask.detach().cpu().bool()
+        output[key] = value
+    output["plddt"] = torch.ones_like(
+        output["token_attention_mask"], dtype=torch.float32
+    )
+    return output
+
+
+def write_probe_pdb(path: Path, features: dict, coords: torch.Tensor, atom_mask: torch.Tensor) -> None:
+    path.write_text(output_to_pdb(probe_output_to_pdb_dict(features, coords, atom_mask)))
+
+
+def pdb_atom_lines_with_chain(pdb_text: str, chain_id: str, serial_start: int) -> tuple[list[str], int]:
+    lines = []
+    serial = serial_start
+    for line in pdb_text.splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        padded = line.ljust(22)
+        lines.append(f"{padded[:6]}{serial:5d}{padded[11:21]}{chain_id}{padded[22:]}")
+        serial += 1
+    if lines:
+        lines.append(f"TER   {serial:5d}      {chain_id}")
+        serial += 1
+    return lines, serial
+
+
+def write_probe_overlay_pdb(
+    path: Path,
+    features: dict,
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    atom_mask: torch.Tensor,
+    noisy: torch.Tensor | None = None,
+) -> None:
+    entries = [
+        ("A", "target_augmented", target),
+        ("B", "prediction", pred),
+    ]
+    if noisy is not None:
+        entries.append(("C", "noisy_input", noisy))
+
+    lines = [
+        "REMARK raw denoise overlay; coordinates are not Kabsch aligned",
+        "REMARK chain A target_augmented",
+        "REMARK chain B prediction",
+    ]
+    if noisy is not None:
+        lines.append("REMARK chain C noisy_input")
+
+    serial = 1
+    for chain_id, _, coords in entries:
+        pdb_text = output_to_pdb(probe_output_to_pdb_dict(features, coords, atom_mask))
+        atom_lines, serial = pdb_atom_lines_with_chain(pdb_text, chain_id, serial)
+        lines.extend(atom_lines)
+    lines.append("END")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def write_probe_sigma_pdbs(
+    domain_dir: Path,
+    sigma: float,
+    features: dict,
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    atom_mask: torch.Tensor,
+    noisy: torch.Tensor | None = None,
+) -> None:
+    sigma_name = sigma_dir_name(float(sigma))
+    write_probe_overlay_pdb(
+        domain_dir / f"{sigma_name}_overlay.pdb",
+        features,
+        target,
+        pred,
+        atom_mask,
+    )
+    if noisy is not None:
+        write_probe_pdb(
+            domain_dir / f"{sigma_name}_noisy.pdb",
+            features,
+            noisy,
+            atom_mask,
+        )
+
+
+def write_probe_reference_pdbs(
+    probe_items: list[tuple[dict, dict, dict]],
+    probe_dir: Path,
+) -> None:
+    reference_dir = probe_dir / "reference_pdbs"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    for features, extra, info in probe_items:
+        domain_dir = reference_dir / denoise_probe_domain_dir_name(info["domain"])
+        domain_dir.mkdir(parents=True, exist_ok=True)
+        write_probe_pdb(
+            domain_dir / f"{info['domain']}_run{info['run']}_frame{info['frame']}_target.pdb",
+            features,
+            extra["target_atom_coords"],
+            extra["target_atom_mask"],
+        )
 
 
 def training_loss(
@@ -690,6 +1184,186 @@ def scalar_if_present(out: dict, key: str) -> float | None:
     if torch.is_tensor(value):
         return float(value.detach().float().mean().cpu())
     return float(value)
+
+
+def append_probe_row(path: Path, row: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=DENOISE_PROBE_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in DENOISE_PROBE_FIELDS})
+
+
+def mean_numeric(rows: list[dict], key: str) -> float | str:
+    values = [
+        float(row[key])
+        for row in rows
+        if row.get(key) != "" and row.get(key) is not None
+    ]
+    if not values:
+        return ""
+    return sum(values) / len(values)
+
+
+def write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, default=str) + "\n")
+
+
+@torch.no_grad()
+def run_denoise_probe(
+    model,
+    probe_items: list[tuple[dict, dict, dict]],
+    args: argparse.Namespace,
+    device: torch.device,
+    probe_dir: Path,
+    epoch: int,
+    step: int,
+) -> list[dict]:
+    if not probe_items:
+        return []
+
+    model.eval()
+    step_dir = probe_dir / f"step_{step}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    probe_sigmas = parse_denoise_probe_sigmas(args.denoise_probe_sigmas, model, device)
+
+    for item_idx, (features, extra, info) in enumerate(probe_items):
+        with fork_validation_rng(device):
+            torch.manual_seed(args.denoise_probe_seed + 100_000 + item_idx)
+            fixed_noise = torch.randn_like(extra["target_atom_coords"])
+
+        for sigma in probe_sigmas:
+            extra_probe = dict(extra)
+            extra_probe["denoise_sigma"] = torch.full(
+                (extra["target_atom_coords"].shape[0],),
+                float(sigma),
+                dtype=torch.float32,
+                device=device,
+            )
+            extra_probe["denoise_noise"] = fixed_noise
+
+            with fork_validation_rng(device):
+                # Same augmentation for every sigma of this domain/step.
+                torch.manual_seed(args.denoise_probe_seed + item_idx)
+                loss, out = training_loss(model, features, extra_probe, args)
+
+            pred = out.get("x_pred", out.get("sample_atom_coords"))
+            if pred is None:
+                raise RuntimeError("denoise probe expected x_pred or sample_atom_coords in model output")
+            target = out.get("target_atom_coords_augmented", extra["target_atom_coords"])
+            mask = out.get("target_atom_mask", extra["target_atom_mask"]).bool()
+            noisy = out.get("x_noisy")
+
+            pred_target_rmsd = masked_rmsd_value(pred, target, mask)
+            noisy_target_rmsd = (
+                masked_rmsd_value(noisy, target, mask)
+                if noisy is not None
+                else ""
+            )
+            row = {
+                "epoch": epoch,
+                "step": step,
+                "domain": info["domain"],
+                "temperature": info["temperature"],
+                "run": info["run"],
+                "frame": info["frame"],
+                "dt_seconds": info["dt_seconds"],
+                "probe_sigma": float(sigma),
+                "sequence_length": info["sequence_length"],
+                "valid_atoms": int(mask.float().sum().detach().cpu()),
+                "loss": float(loss.detach().cpu()),
+                "noise_sigma_mean": scalar_if_present(out, "noise_sigma_mean"),
+                "model_denoise_rmsd": scalar_if_present(out, "denoise_rmsd"),
+                "model_noisy_rmsd": scalar_if_present(out, "noisy_rmsd"),
+                "pred_target_rmsd": pred_target_rmsd,
+                "noisy_target_rmsd": noisy_target_rmsd,
+                "rmsd_improvement": (
+                    noisy_target_rmsd - pred_target_rmsd
+                    if isinstance(noisy_target_rmsd, float)
+                    else ""
+                ),
+                "pred_rg": radius_of_gyration_value(pred, mask),
+                "target_rg": radius_of_gyration_value(target, mask),
+                **probe_geometry_metrics(pred, features, mask),
+            }
+            rows.append(row)
+            append_probe_row(probe_dir / "metrics.csv", row)
+
+            if args.denoise_probe_write_pdbs:
+                domain_dir = step_dir / denoise_probe_domain_dir_name(info["domain"])
+                domain_dir.mkdir(parents=True, exist_ok=True)
+                write_probe_sigma_pdbs(
+                    domain_dir,
+                    float(sigma),
+                    features,
+                    target,
+                    pred,
+                    mask,
+                    noisy,
+                )
+
+    summary = {
+        "epoch": epoch,
+        "step": step,
+        "domains": sorted({row["domain"] for row in rows}),
+        "probe_sigmas": probe_sigmas,
+        "mean_pred_target_rmsd": mean_numeric(rows, "pred_target_rmsd"),
+        "mean_noisy_target_rmsd": mean_numeric(rows, "noisy_target_rmsd"),
+        "mean_rmsd_improvement": mean_numeric(rows, "rmsd_improvement"),
+        "mean_noise_sigma": mean_numeric(rows, "noise_sigma_mean"),
+        "per_sigma": {
+            str(float(sigma)): {
+                "mean_pred_target_rmsd": mean_numeric(
+                    [row for row in rows if float(row["probe_sigma"]) == float(sigma)],
+                    "pred_target_rmsd",
+                ),
+                "mean_noisy_target_rmsd": mean_numeric(
+                    [row for row in rows if float(row["probe_sigma"]) == float(sigma)],
+                    "noisy_target_rmsd",
+                ),
+                "mean_rmsd_improvement": mean_numeric(
+                    [row for row in rows if float(row["probe_sigma"]) == float(sigma)],
+                    "rmsd_improvement",
+                ),
+                "local_bond_bad": sum(
+                    int(row["local_bond_bad"])
+                    for row in rows
+                    if float(row["probe_sigma"]) == float(sigma)
+                ),
+                "local_bond_total": sum(
+                    int(row["local_bond_total"])
+                    for row in rows
+                    if float(row["probe_sigma"]) == float(sigma)
+                ),
+            }
+            for sigma in probe_sigmas
+        },
+        "local_bond_bad": sum(int(row["local_bond_bad"]) for row in rows),
+        "local_bond_total": sum(int(row["local_bond_total"]) for row in rows),
+    }
+    if summary["local_bond_total"]:
+        summary["local_bond_bad_fraction"] = (
+            summary["local_bond_bad"] / summary["local_bond_total"]
+        )
+    for sigma_summary in summary["per_sigma"].values():
+        if sigma_summary["local_bond_total"]:
+            sigma_summary["local_bond_bad_fraction"] = (
+                sigma_summary["local_bond_bad"] / sigma_summary["local_bond_total"]
+            )
+    write_json(step_dir / "summary.json", summary)
+    stage1_train_mode(model)
+
+    print(
+        "denoise_probe "
+        f"epoch={epoch} step={step} "
+        f"pred_rmsd={summary['mean_pred_target_rmsd']:.5f} "
+        f"bad_bonds={summary['local_bond_bad']}/{summary['local_bond_total']}"
+    )
+    return rows
 
 
 def state_dict_to_cpu(state_dict: dict) -> dict:
@@ -856,6 +1530,49 @@ def main() -> int:
     if val_records and not validation_batches:
         print("validation disabled: no validation batches fit val_length_max")
 
+    denoise_probe_dir = run_dir / args.denoise_probe_dir
+    denoise_probe_items = build_denoise_probe_items(
+        val_records,
+        args,
+        feature_cache,
+        device,
+    )
+    if denoise_probe_items:
+        denoise_probe_dir.mkdir(parents=True, exist_ok=True)
+        probe_domains = [info["domain"] for _, _, info in denoise_probe_items]
+        (denoise_probe_dir / "probe_domains.txt").write_text(
+            "\n".join(probe_domains) + "\n"
+        )
+        write_probe_reference_pdbs(denoise_probe_items, denoise_probe_dir)
+        write_json(
+            denoise_probe_dir / "config.json",
+            {
+                "every": args.denoise_probe_every,
+                "domains": probe_domains,
+                "run": args.denoise_probe_run,
+                "frame": args.denoise_probe_frame,
+                "delta_frames": args.denoise_probe_delta_frames,
+                "dt_seconds": args.denoise_probe_delta_frames * args.frame_time_ns * 1e-9,
+                "sigmas": parse_denoise_probe_sigmas(args.denoise_probe_sigmas, model, device),
+                "seed": args.denoise_probe_seed,
+                "write_pdbs": args.denoise_probe_write_pdbs,
+                "note": (
+                    "Fixed x_t -> x_t probe. The probe passes explicit sigma/noise "
+                    "through forward_train and saves noisy/prediction PDBs per sigma."
+                ),
+            },
+        )
+
+        run_denoise_probe(
+            model,
+            denoise_probe_items,
+            args,
+            device,
+            denoise_probe_dir,
+            epoch=start_epoch,
+            step=global_step,
+        )
+
     if validation_batches and args.resume_checkpoint is None:
         run_validation(
             model,
@@ -915,6 +1632,17 @@ def main() -> int:
                     args,
                     device,
                     validation_csv,
+                    epoch=epoch,
+                    step=global_step,
+                )
+
+            if denoise_probe_items and global_step % args.denoise_probe_every == 0:
+                run_denoise_probe(
+                    model,
+                    denoise_probe_items,
+                    args,
+                    device,
+                    denoise_probe_dir,
                     epoch=epoch,
                     step=global_step,
                 )
